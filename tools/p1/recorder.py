@@ -43,6 +43,45 @@ def speech_thresh(noise_floor: float) -> float:
     return max(noise_floor * 2.5, 25.0)
 
 
+def active_level(pcm: bytes, rate: int, frame_s: float = 0.05) -> tuple[float, float, int]:
+    """只算「有聲段落」的位準。回傳 (dBFS, 有聲時間佔比, 有聲秒數)。
+
+    為什麼不能拿整段平均當音量？因為錄音前後都有靜音，
+    整段平均會嚴重低估說話音量。實測實際案例：
+
+        整段平均 -42.2 dBFS  →  看起來「太小聲」
+        實際說話 -37.3 dBFS  →  其實還算正常
+
+    用整段平均會產生**假警報**，叫使用者重錄根本不需要的東西。
+    這裡用第 25 百分位估底噪，再用 `speech_thresh()` 取門檻。
+    """
+    import math
+
+    n = len(pcm) // 2
+    if n == 0:
+        return float("-inf"), 0.0, 0
+    s = struct.unpack(f"<{n}h", pcm[:n * 2])
+    win = max(1, int(rate * frame_s))
+    frames = []
+    for i in range(0, n - win + 1, win):
+        seg = s[i:i + win]
+        frames.append((sum(v * v for v in seg) / len(seg)) ** 0.5)
+    if not frames:
+        return float("-inf"), 0.0, 0
+
+    srt = sorted(frames)
+    noise = srt[len(srt) // 4]
+    thr = speech_thresh(noise)
+    active = [i for i, v in enumerate(frames) if v > thr]
+    if not active:
+        return float("-inf"), 0.0, 0
+
+    vals = [v for i in active for v in s[i * win:(i + 1) * win]]
+    rms = (sum(v * v for v in vals) / len(vals)) ** 0.5
+    db = 20.0 * math.log10(rms / 32768.0) if rms > 0 else float("-inf")
+    return db, len(active) / len(frames), len(active) * frame_s
+
+
 def meter(rms: float, width: int = 30) -> str:
     """把 RMS 畫成條狀圖（滿刻度 32768）。"""
     import math

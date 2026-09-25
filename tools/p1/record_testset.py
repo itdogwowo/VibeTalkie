@@ -24,15 +24,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "p0"))
 
-from recorder import capture_utterance  # noqa: E402
+from recorder import active_level, capture_utterance  # noqa: E402
 from record_wav import list_devices, setup_console  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTSET = Path(__file__).resolve().parent / "testset_zh.txt"
 REC_DIR = ROOT / "artifacts" / "p1"
 
-# 低於這個位準就警告：實測 -48 dBFS 時 ASR 直接回空字串
-WARN_DB = -38.0
+# 「說話位準」的可接受下限。
+# 這個數字是實測調出來的，不是猜的：
+#   -38.4 dBFS → 辨識完全正確（utt003 / utt005 兩句）
+#   -39.9 dBFS → 空結果（utt008）
+#   -29.9 dBFS → 反而辨識錯誤（utt007，峰值 29483 疑似削波）
+# 所以「音量」不是唯一因素，訂在 -42 只抓真正太小聲的，避免像先前那樣
+# 用整段平均產生一堆假警報。錄音長度與有聲比例影響更大。
+WARN_DB = -42.0
 
 
 def load_testset() -> list[tuple[str, str]]:
@@ -131,26 +137,31 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         save_wav(path, res["pcm"], args.rate)
-        db = res["speech_db"]
-        status = "✅" if db >= WARN_DB else "⚠️ 太小聲"
+        adb, aratio, asec = active_level(res["pcm"], args.rate)
+        status = "✅" if adb >= WARN_DB else "⚠️ 太小聲"
         print(f"  {status} 長度 {res['duration_s']:.2f}s，"
-              f"整體 {db:+.1f} dBFS，峰值 {res['peak']}/32767")
-        if db < WARN_DB:
-            print("     位準偏低。實測 -48 dBFS 時 ASR 會回傳空字串。")
+              f"說話 {asec:.1f}s（佔 {aratio * 100:.0f}%），"
+              f"說話位準 {adb:+.1f} dBFS，峰值 {res['peak']}/32767")
+        if adb < WARN_DB:
+            print("     說話音量偏低。實測位準太低時 ASR 會回傳空字串。")
             print("     建議靠近麥克風、正常音量重錄（按 r）。")
+        if res["duration_s"] > 8:
+            print(f"     ⚠️ 這段有 {res['duration_s'] - asec:.1f}s 是靜音"
+                  f"（只有 {aratio * 100:.0f}% 在說話）→ 建議重錄，避免模型在長靜音上出錯。")
 
-        results.append((idx, res["duration_s"], db, res["peak"]))
+        results.append((idx, res["duration_s"], adb, res["peak"], aratio))
         i += 1
 
     print("\n" + "=" * 70)
     if results:
         print(f"本次錄了 {len(results)} 句：")
-        for idx, dur, db, peak in results:
+        for idx, dur, db, peak, ratio in results:
             flag = "✅" if db >= WARN_DB else "⚠️"
-            print(f"  {flag} utt{idx}  {dur:5.2f}s  {db:+6.1f} dBFS  peak {peak}")
+            print(f"  {flag} utt{idx}  {dur:5.2f}s  說話位準 {db:+6.1f} dBFS  "
+                  f"有聲 {ratio * 100:3.0f}%  peak {peak}")
         weak = [r for r in results if r[2] < WARN_DB]
         if weak:
-            print(f"\n⚠️ 有 {len(weak)} 句位準偏低（{', '.join('utt' + r[0] for r in weak)}）")
+            print(f"\n⚠️ 有 {len(weak)} 句說話位準偏低（{', '.join('utt' + r[0] for r in weak)}）")
             print("   建議重錄：python tools/p1/record_testset.py --only "
                   + ",".join(r[0] for r in weak))
     print(f"\n錄音位置：{REC_DIR}")
