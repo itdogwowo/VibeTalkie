@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=VibeTalkie
+Name[zh_TW]=VibeTalkie 語音輸入
+Comment=按住錄音鍵說話，放開就出字（全本機辨識）
+Comment[zh_TW]=按住錄音鍵說話，放開就出字（全本機辨識）
+# %k 是這個 .desktop 檔本身的完整路徑，所以不必寫死專案位置。
+Exec=sh -c 'cd "$(dirname "$1")" && exec python3 launch.py' sh %k
+Icon=audio-input-microphone
+Terminal=true
+Categories=Utility;Accessibility;
+Keywords=speech;voice;dictation;asr;語音;聽寫;
+
+# 安裝方式（讓它出現在應用程式選單並可雙擊）：
+#   cp VibeTalkie.desktop ~/.local/share/applications/
+#   chmod +x ~/.local/share/applications/VibeTalkie.desktop
+#
+# ⚠️ 目前只有 Windows 實作；在 Linux 上會由 launch.py 明確告知尚未支援。
