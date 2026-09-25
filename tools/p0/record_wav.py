@@ -214,13 +214,21 @@ PROBE_RATES = [8000, 16000, 22050, 32000, 44100, 48000]
 
 
 def estimate_bandwidth(data: bytes, rate: int, bits: int) -> dict | None:
-    """用頻譜估計音訊真正的頻寬上限。
+    """判定音訊底層的頻寬（8 kHz 窄頻 vs 16 kHz 寬頻）。
 
     為什麼不能只靠「驅動接受 16 kHz」？因為 Windows 藍牙音訊堆疊會**重採樣**：
     即使底層 HFP 連結是 8 kHz 窄頻，你要求 16 kHz 它也會照樣接受，
     再內插成 16 kHz —— 資料裡高於 4 kHz 的部分全是空的。
 
-    所以唯一誠實的測法：錄音後看頻譜高頻端有沒有能量。
+    ⚠️ 為什麼不能只看「高頻有能量」？
+    極安靜的錄音（例如只有底噪）在高頻帶會充滿**量化雜訊**，
+    看起來也有能量，會被誤判成寬頻。實測：純底噪錄音的 4–8k/0.3–3k 比值約 -20 dB，
+    與正常語音同級 → 這個比值**單獨看沒有判別力**。
+
+    正確的判別方式：**高頻帶會不會「跟著聲音變大」**。
+      - 8 kHz 窄頻連結：4 kHz 以上永遠是雜訊底，大聲段落與安靜段落**一樣低**。
+      - 16 kHz 寬頻連結：發『ㄙ』這類高頻音時，4–8 kHz 會**明顯上升**。
+    所以本函式比較「最大聲段落」與「最安靜段落」在高頻帶的**絕對能量差**（delta）。
 
     回傳 None 表示沒有 numpy（可選依賴）。
     """
@@ -232,58 +240,106 @@ def estimate_bandwidth(data: bytes, rate: int, bits: int) -> dict | None:
         return None
 
     dt = np.dtype(np.int16 if bits == 16 else np.uint8)
-    samples = np.frombuffer(data[:len(data) - (len(data) % dt.itemsize)], dtype=dt).astype(np.float64)
+    usable = len(data) - (len(data) % dt.itemsize)
+    samples = np.frombuffer(data[:usable], dtype=dt).astype(np.float64)
     if bits == 8:
         samples -= 128.0
-    if samples.size < 2048:
+    if samples.size < 4096:
         return None
 
-    # 去直流 + Hann 窗，避免頻譜洩漏
-    samples -= samples.mean()
-    window = np.hanning(samples.size)
-    spectrum = np.abs(np.fft.rfft(samples * window))
-    freqs = np.fft.rfftfreq(samples.size, d=1.0 / rate)
-    if spectrum.max() <= 0:
+    frame_len = max(1024, int(rate * 0.032))
+    hop = frame_len // 2
+    starts = list(range(0, samples.size - frame_len + 1, hop))
+    if not starts:
         return None
 
-    db = 20.0 * np.log10(np.maximum(spectrum, 1e-12) / spectrum.max())
+    window = np.hanning(frame_len)
+    specs = []
+    frame_rms = []
+    for s in starts:
+        seg = samples[s:s + frame_len]
+        specs.append(np.abs(np.fft.rfft(seg * window)) ** 2)
+        # 位準一律用**時域 RMS** 計算。FFT 的絕對尺度取了決於窗長與窗函式，
+        # 拿它當 dBFS 會嚴重高估（實測會把 -62 dBFS 的底噪算成 -9.5 dBFS）。
+        frame_rms.append(float(np.sqrt(np.mean(seg ** 2))))
+    specs = np.array(specs)
+    frame_rms = np.array(frame_rms)
+    freqs = np.fft.rfftfreq(frame_len, d=1.0 / rate)
+    hi_band = (freqs >= 4000) & (freqs < min(rate / 2.0, 8000))
 
-    # 由高頻往低頻找第一個「明顯有能量」的點（門檻 -50 dB）
-    threshold = -50.0
-    above = np.nonzero(db > threshold)[0]
-    if above.size == 0:
-        return None
-    cutoff = float(freqs[above[-1]])
-    nyquist = rate / 2.0
+    total_power = specs.sum(axis=1)  # noqa: F841  保留供未來分析，不參與判定
+    order = np.argsort(frame_rms)
+    top_n = max(1, len(order) // 4)
+    active_rows, quiet_rows = order[-top_n:], order[:top_n]
 
-    # 判定邏輯：
-    #   若能量只到 ~4 kHz 就斷掉 → 底層是 8 kHz 窄頻（CVSD）。
-    #   若能量一路到 Nyquist  → 來源頻寬至少等於目前取樣率的一半，沒有被窄頻限制。
-    #   但要注意：環境底噪也是寬頻的，所以「填滿整個頻帶」也可能是純底噪。
-    #   真正可靠的測法是有說話、且含『ㄙ』這類高頻音。
-    if cutoff >= nyquist * 0.95:
-        verdict = "fills-band"
-        note = (f"✅ 能量一路到 Nyquist（{nyquist:.0f} Hz），來源沒有被 8 kHz 窄頻限制。"
-                "但環境底噪也會填滿頻帶 —— 必須在有說話／發『ㄙ』音時重測才可採信。")
-    elif cutoff <= 4500:
-        verdict = "narrowband"
-        note = ("⚠️ 頻寬只到 ~4 kHz，底層應是 8 kHz 窄頻（CVSD）。"
-                "這會拉低中文辨識率，必須回報並考慮對策。")
-    else:
-        verdict = "indeterminate"
-        note = "🤔 落在中間，無法判定。請錄一段長音『ㄙ』（或噓聲）再測一次。"
+    full_scale = 32768.0 if bits == 16 else 128.0
+    active_level_db = 20.0 * np.log10(max(float(frame_rms[active_rows].mean()), 1e-12) / full_scale)
+    peak = float(np.abs(samples).max())
 
-    return {"cutoff_hz": cutoff, "verdict": verdict, "note": note,
-            "nyquist_hz": nyquist, "total_samples": int(samples.size)}
+    def hf_band_db(rows) -> float:
+        """高頻帶（4–8 kHz）在這些段落的能量位準。
+
+        尺度是任意的（FFT 功率未正規化）—— 但因為只拿來做**同一份錄音內**
+        大聲段落與安靜段落的相減，任意但一致的尺度不影響判讀。
+        絕對音量一律由時域 RMS 負責。
+        """
+        if not hi_band.any():
+            return float("-inf")
+        p = float(specs[rows][:, hi_band].mean())
+        return 10.0 * np.log10(p) if p > 0 else float("-inf")
+
+    hf_active_db = hf_band_db(active_rows)
+    hf_quiet_db = hf_band_db(quiet_rows)
+    delta_db = (hf_active_db - hf_quiet_db
+                if hf_active_db > float("-inf") and hf_quiet_db > float("-inf") else 0.0)
+
+    base = {"nyquist_hz": rate / 2.0, "delta_db": delta_db,
+            "hf_active_db": hf_active_db, "hf_quiet_db": hf_quiet_db,
+            "active_level_db": active_level_db, "peak": peak,
+            "frames": len(order)}
+
+    if not hi_band.any():
+        return {**base, "verdict": "narrowband",
+                "note": "⚠️ 取樣率本身不到 4 kHz 以上，無法判定。"}
+
+    if active_level_db < -45:
+        return {**base, "verdict": "too-quiet",
+                "note": (f"⚠️ 這段錄音幾乎是靜音（最大聲段落只有 {active_level_db:+.1f} dBFS）。"
+                         "無法判定頻寬 —— 請**確定出聲**再錄一次。純底噪的頻譜會騙人。")}
+
+    if delta_db >= 6.0 and active_level_db < -40:
+        return {**base, "verdict": "low-level",
+                "note": (f"⚠️ 高頻有反應，但整段訊號太小聲（{active_level_db:+.1f} dBFS）"
+                         "→ 可能只是單一寬頻雜音，不足以判定。"
+                         "請**靠近麥克風正常音量說話**並發『ㄙ～～』重測。")}
+
+    if delta_db >= 6.0:
+        return {**base, "verdict": "wideband",
+                "note": (f"✅ 高頻帶佔比明顯跟著聲音上升（+{delta_db:.1f} dB），"
+                         f"訊號位準足夠（{active_level_db:+.1f} dBFS）→ "
+                         "底層是 **16 kHz 寬頻**，ASR 可用。")}
+    if delta_db < 3.0:
+        return {**base, "verdict": "no-hf-response",
+                "note": ("⚠️ 高頻帶佔比幾乎不隨聲音變化 → 兩種可能："
+                         "(a) 底層是 **8 kHz 窄頻**，或 "
+                         "(b) 你的語音本來就沒有高頻（例如只發母音）。"
+                         "請**拉長音發『ㄙ～～』**重測，才能區分這兩者。")}
+    return {**base, "verdict": "indeterminate",
+            "note": "🤔 介於中間。請拉長音發『ㄙ～～』再測一次。"}
 
 
 def report_bandwidth(data: bytes, rate: int, bits: int) -> None:
     result = estimate_bandwidth(data, rate, bits)
     if result is None:
-        print("  （未安裝 numpy，跳過頻寬分析。numpy 已在本機可用，請確認環境。）")
+        print("  （未安裝 numpy 或音訊過短，跳過頻寬分析。）")
         return
-    print(f"  頻寬上限: ~{result['cutoff_hz']:.0f} Hz（-50 dB 門檻）")
-    print(f"  判定    : {result['verdict']} — {result['note']}")
+    print(f"  訊號位準          : 主動段落 {result['active_level_db']:+.1f} dBFS，"
+          f"峰值 {result['peak']:.0f} / 32767")
+    print(f"  高頻帶(4–8k) 位準 : 大聲段落 {result['hf_active_db']:+.1f} dB，"
+          f"安靜段落 {result['hf_quiet_db']:+.1f} dB（相對值，只看差值）")
+    print(f"  → 高頻帶上升量    : {result['delta_db']:+.1f} dB"
+          f"   （>= +6 代表高頻真的跟著聲音出現 → 寬頻；< +3 代表高頻沒反應）")
+    print(f"  判定: {result['verdict']} — {result['note']}")
 
 
 def cmd_probe(device_id: int, channels: int, bits: int) -> int:
@@ -402,9 +458,30 @@ def record(device_id: int, seconds: float, rate: int, channels: int, bits: int,
     return 0
 
 
+def cmd_analyze_wav(path: Path) -> int:
+    """對既有的 WAV 重跑頻寬分析，不必重錄。"""
+    if not path.exists():
+        print(f"找不到檔案：{path}", file=sys.stderr)
+        return 1
+    with wave.open(str(path), "rb") as wf:
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        data = wf.readframes(wf.getnframes())
+        frames = wf.getnframes()
+    print(f"{path}")
+    print(f"  格式: {rate} Hz / {channels}ch / {width * 8}-bit / {frames} frames "
+          f"({frames / rate:.2f} 秒)")
+    report_bandwidth(data, rate, width * 8)
+    print("\n提示：判定要可信，錄音時必須**有說話**且**拉長音發『ㄙ』**。")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="P0/T2：指定裝置錄音與取樣率探測")
     parser.add_argument("--list", action="store_true", help="列舉輸入裝置後結束")
+    parser.add_argument("--analyze-wav", default=None, metavar="WAV",
+                        help="對既有 WAV 重跑頻寬分析，不必重錄")
     parser.add_argument("--probe", action="store_true", help="探測各取樣率是否被接受")
     parser.add_argument("--device", type=int, default=None,
                         help="裝置索引（用 --list 查）")
@@ -418,6 +495,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         return cmd_list()
+
+    if args.analyze_wav:
+        return cmd_analyze_wav(Path(args.analyze_wav))
 
     if args.device is None:
         parser.error("請用 --device N 指定裝置（先跑 --list），或用 --list 檢視。")
