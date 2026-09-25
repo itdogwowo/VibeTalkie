@@ -72,8 +72,11 @@ VibeTalkie/
 ├─ app/                   # 可用的殼層（P4 前的務實產物）
 │  ├─ vibetalkie.py       # 進入點：PTT 常駐 + 本機 HTTP 伺服器
 │  ├─ config.py           # TOML 設定
+│  ├─ models.py           # 模型下載管理（背景執行、可取消）
+│  ├─ model_index.py      # 官方模型清單：抓取 → 分類 → 快取
 │  └─ ui/
-│     ├─ index.html       # 只放結構與樣式（**不要放 inline JS**，見 §8.5）
+│     ├─ index.html       # 分頁結構（**不要放 inline JS**，見 §8.5）
+│     ├─ style.css        # 樣式
 │     └─ app.js           # UI 邏輯（改了重新整理即可，不用編譯）
 ├─ tools/p0/              # P0 硬體驗證工具
 ├─ tools/p1/              # P1：ASR 引擎、熱鍵、注入、診斷工具
@@ -299,6 +302,8 @@ for ($i=0; $i -lt $b.Length; $i++) {
 
 ```powershell
 python app/test_status_contract.py       # UI ↔ /api/status 欄位契約
+python app/test_model_index.py           # 模型分類器（可用/不可用判斷）
+python app/test_model_index.py --live    # 對真實 499 筆跑統計（需連網）
 python app/test_models_api.py            # 模型下載／切換 API
 python tools/p1/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
 python tools/p0/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）

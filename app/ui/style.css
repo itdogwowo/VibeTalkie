@@ -1,0 +1,132 @@
+/* VibeTalkie UI 樣式
+ *
+ * 刻意與 HTML 分開（見 AGENTS.md §8.5：HTML 不要放 inline script/style 之外的東西，
+ * 而且在非瀏覽器行程下載含 JS 的網頁會踩到 AMSI 規則）。
+ * 純靜態檔案 —— 改完重新整理即可，不需要任何建置步驟。
+ */
+
+:root{
+  --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#262d3a;
+  --fg:#e6edf3; --dim:#8b949e; --accent:#4f9cf9; --ok:#3fb950;
+  --warn:#d29922; --err:#f85149; --rec:#ff4d4d;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.6 "Segoe UI","Noto Sans TC",system-ui,-apple-system,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:900px;margin:0 auto;padding:26px 20px 60px}
+
+header{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.logo{
+  width:38px;height:38px;border-radius:10px;flex:0 0 auto;
+  background:linear-gradient(135deg,var(--accent),#8b5cf6);
+  display:grid;place-items:center;font-size:19px;
+}
+h1{font-size:19px;margin:0;font-weight:650;letter-spacing:.2px}
+.sub{color:var(--dim);font-size:12.5px;margin-top:1px}
+
+/* 分頁 */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:18px}
+.tab{
+  background:none;border:0;border-bottom:2px solid transparent;
+  color:var(--dim);font:inherit;font-weight:600;padding:9px 15px;cursor:pointer;
+  border-radius:8px 8px 0 0;
+}
+.tab:hover{color:var(--fg);background:rgba(255,255,255,.03)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.page{display:none}
+.page.active{display:block}
+
+/* 狀態燈 */
+.dot{
+  width:13px;height:13px;border-radius:50%;background:var(--dim);
+  flex:0 0 auto;transition:background .18s;display:inline-block;
+}
+.dot.idle{background:var(--ok);box-shadow:0 0 0 4px rgba(63,185,80,.14)}
+.dot.recording{background:var(--rec);animation:pulse 1s infinite}
+.dot.processing,.dot.inserting{background:var(--warn);animation:pulse 1s infinite}
+.dot.error{background:var(--err)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.status{
+  display:flex;align-items:center;gap:16px;background:var(--panel);
+  border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;
+}
+.statetext{font-size:16px;font-weight:600}
+.statemeta{color:var(--dim);font-size:12.5px}
+
+.card{
+  background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--radius);padding:18px 20px;margin-bottom:16px;
+}
+.card h2{
+  font-size:12.5px;text-transform:uppercase;letter-spacing:.9px;
+  color:var(--dim);margin:0 0 14px;font-weight:600;
+}
+.row{display:flex;justify-content:space-between;align-items:center;
+     padding:9px 0;border-bottom:1px solid var(--line);gap:12px}
+.row:last-child{border-bottom:0}
+.row .k{color:var(--dim);flex:0 0 auto}
+.row .v{text-align:right;word-break:break-all;font-variant-numeric:tabular-nums}
+.kv{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+
+select,input[type=text],input[type=search]{
+  background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:8px;padding:7px 10px;font:inherit;min-width:150px;
+}
+select:focus,input:focus{outline:none;border-color:var(--accent)}
+label.switch{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none}
+input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);cursor:pointer}
+
+button{
+  background:var(--accent);color:#fff;border:0;border-radius:8px;
+  padding:9px 16px;font:inherit;font-weight:600;cursor:pointer;
+}
+button:hover{filter:brightness(1.1)}
+button:disabled{opacity:.5;cursor:default;filter:none}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
+button.sm{padding:6px 12px;font-size:12.5px}
+
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.toolbar input[type=search]{flex:1;min-width:180px}
+
+#log{max-height:260px;overflow:auto}
+.entry{padding:10px 0;border-bottom:1px solid var(--line)}
+.entry:last-child{border-bottom:0}
+.entry .txt{font-size:15px;margin-bottom:3px}
+.entry .meta{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums}
+.empty{color:var(--dim);text-align:center;padding:22px 0;font-size:13px}
+
+.note{
+  margin-bottom:16px;padding:12px 16px;border-radius:10px;font-size:12.5px;
+  background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.35);
+  color:#e3b341;
+}
+.hint{color:var(--dim);font-size:12px;line-height:1.6;margin-bottom:10px}
+.foot{margin-top:22px;color:var(--dim);font-size:11.5px;text-align:center}
+.bar{height:4px;background:var(--panel2);border-radius:2px;overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .08s linear}
+
+/* 模型清單 */
+.model{display:flex;gap:14px;align-items:flex-start;
+       padding:13px 0;border-bottom:1px solid var(--line)}
+.model:last-child{border-bottom:0}
+.model.dim{opacity:.55}
+.model .info{flex:1;min-width:0}
+.model .name{font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.model .desc{color:var(--dim);font-size:12px;margin-top:3px;line-height:1.5}
+.model .side{flex:0 0 auto;text-align:right;display:flex;flex-direction:column;
+             align-items:flex-end;gap:7px;min-width:140px}
+.tag{font-size:10.5px;padding:2px 7px;border-radius:99px;font-weight:600;
+     border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+.tag.on{background:rgba(63,185,80,.15);border-color:rgba(63,185,80,.5);color:var(--ok)}
+.tag.rec{background:rgba(79,156,249,.15);border-color:rgba(79,156,249,.5);color:var(--accent)}
+.tag.no{background:rgba(139,148,158,.12)}
+.tag.bad{background:rgba(248,81,73,.13);border-color:rgba(248,81,73,.45);color:var(--err)}
+.size{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums}
+.pbar{height:5px;background:var(--panel2);border-radius:3px;overflow:hidden;
+      margin-top:8px;width:100%}
+.pbar i{display:block;height:100%;background:var(--accent);transition:width .2s}

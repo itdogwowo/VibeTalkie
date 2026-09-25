@@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT / "tools" / "p1"))
 sys.path.insert(0, str(ROOT / "tools" / "p0"))
 
 from config import Config  # noqa: E402
+import config as config_module  # noqa: E402
 import models  # noqa: E402
+import model_index  # noqa: E402
 from models import ModelManager  # noqa: E402
 from speech_engine import build_engine, has_opencc  # noqa: E402
 from ptt import PttDaemon  # noqa: E402
@@ -70,6 +72,10 @@ class Status:
         self.engine = None
         self.models: ModelManager | None = None
         self.daemon = None      # 切換模型前要檢查它是不是 IDLE
+        # 「關於」分頁要顯示的資訊
+        self.models_dir = str(models.MODELS_DIR)
+        self.config_path = str(config_module.CONFIG_PATH)
+        self.opencc = False
 
     # -- 給 daemon 的回呼 --
     def on_state(self, state: str) -> None:
@@ -117,6 +123,9 @@ class Status:
             "model": d["model"],
             "error": d["error"],
             "downloads": (self.models.active_downloads() if self.models else []),
+            "models_dir": self.models_dir,
+            "config_path": self.config_path,
+            "opencc": self.opencc,
         }
 
 
@@ -252,11 +261,39 @@ def make_handler(status: Status):
                 mgr = status.models
                 if mgr is None:
                     return self._json({"models": [], "error": "模型管理未初始化"})
-                return self._json({
-                    "models": mgr.list_models(status.cfg.model_dir),
-                    "models_dir": str(models.MODELS_DIR),
-                    "release": models.RELEASE_TAG,
-                })
+                # refresh=1 強制重抓 GitHub（UI 的「重新整理清單」按鈕）
+                force = "refresh=1" in self.path
+                cat = model_index.catalog(force=force)
+                active = status.cfg.model_dir
+                with mgr._lock:
+                    dl = {k: v.snapshot() for k, v in mgr._downloads.items()}
+                for m in cat["models"]:
+                    info = dl.get(m["name"])
+                    if info and info["state"] in ("queued", "downloading", "extracting"):
+                        m["state"] = info["state"]
+                    elif models.is_ready(m["name"]):
+                        m["state"] = "ready"
+                    elif info and info["state"] == "error":
+                        m["state"] = "error"
+                    else:
+                        m["state"] = "absent"
+                    m["download"] = info
+                    m["active"] = (m["name"] == active)
+                    # 目錄裡沒列、但本機已安裝的（例如自己放的）也要算 ready
+                    m["title"] = m["name"]
+                # 本機額外安裝、但不在官方清單裡的模型
+                listed = {m["name"] for m in cat["models"]}
+                for extra in models.installed_models():
+                    if extra in listed:
+                        continue
+                    cat["models"].insert(0, {
+                        "name": extra, "asset": None, "size_mb": models.disk_usage_mb(extra),
+                        "family": "unknown", "supported": True, "reason": "",
+                        "langs": "", "url": None, "state": "ready",
+                        "download": None, "active": extra == active, "title": extra,
+                        "note": "本機既有（不在官方清單中）",
+                    })
+                return self._json(cat)
             if path == "/api/config":
                 cfg = status.cfg
                 devs = []
@@ -457,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
     status.mic_warning = mic_warning
     status.engine = engine
     status.models = ModelManager(on_change=lambda: None)
+    status.opencc = has_opencc()
 
     daemon = PttDaemon(
         engine,
