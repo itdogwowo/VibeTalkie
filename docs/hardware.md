@@ -363,4 +363,65 @@ Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' 
 - `architecture.md` 需要新增「**原廠工具偵測與排除**」的模組職責。
 - `adr/0001-stack.md` 的「全域熱鍵」評分基準要加上「可抑制 + 可辨識裝置 + 能與第三方 hook 共存」。
 
+---
+
+### 8.6 原廠工具技術剖析（本機實測，未讀取任何個人內容）
+
+| 項目 | 實測結果 |
+|---|---|
+| 版本 | `0.7.8`，開發者 探未（武汉）科技有限公司 |
+| 應用框架 | **Tauri** —— exe 內含 `tauri` / `tao` / `wry` / `WebView2` 字串；資料在 `%LOCALAPPDATA%\cn.shandianshuo.desktop\EBWebView` |
+| 內建 ASR 模型 | **`sensevoice-small`**（SenseVoiceSmall，`model.onnx` 約 241 MB） |
+| 推論引擎 | exe 內含 `onnxruntime`、`SenseVoice`、`whisper` 字串；**未見 `sherpa`** → 很可能是直接用 onnxruntime |
+| 設定檔位置 | `%APPDATA%\Shandianshuo\config.json`（**已存在的功能清單見下**） |
+| 本機保留資料 | `recordings/`（**5 個檔案、約 3.3 MB → 有保留錄音**）、`transcriptions.json`（逐字稿）、`memory/knowledge/`（個人知識庫）、`skills/`（空） |
+
+> 🔒 上述僅為**結構與計數**。逐字稿、知識庫、錄音內容、`config.json` 的值
+> **一律沒有讀取**，也沒有進入本 repo。
+
+#### 從 `config.json` 的「鍵名」看出的既有功能
+
+原廠工具**已經實作**了本計畫打算做的事，而且更多：
+
+| 鍵名 | 對應到本計畫的哪個模組 |
+|---|---|
+| `injection_mode`、`use_direct_input` | `textin`（文字注入） |
+| `hotkey`、`recording_hotkey`、`unified_hotkey{keys, **block_keys**}` | `hotkey` |
+| `mute_while_recording`、`silent_start` | `audio` |
+| `save_transcription_to_clipboard` | `textin`（剪貼簿路徑） |
+| `text_normalization_*`、`remove_trailing_period` | ASR 後處理 |
+| `windows_recording_key` / `macos_recording_key` | 跨平台按鍵 |
+| `asr{provider, local_enabled, local_parakeet_enabled, aliyun, volcengine, stepfun, mimo, soniox, elevenlabs, openai_realtime, custom_providers}` | 多引擎（本地 + 大量雲端） |
+| `ai{correction, chat, memory_learning, input_assistant, personal_preference, codex_network}` | **LLM 糾錯／聊天／記憶**（本計畫明確不做） |
+
+**兩個關鍵發現：**
+
+1. **`block_keys` 的存在，反證了 §3.4 的結論。**
+   一個認真的商業競品也要處理「按鍵漏進前景視窗」，而它的解法就是「設定要阻擋的鍵」。
+   → 我們的分析方向正確，而且這是**必要功能**，不是加分項。
+
+2. **競品同時支援「本地」與「一大串雲端」ASR。**
+   本計畫的 v1 是全本地、零強制上傳 → **差異化不在「能不能本地」，而在「只有本地」**。
+
+### 8.7 定位結論（提供給使用者決策，不是代替決策）
+
+| 面向 | 閃電說 0.7.8 | VibeTalkie（計畫 v1） | 有差異嗎 |
+|---|---|---|---|
+| ASR | 本地 SenseVoice **＋ 多雲端** | 本地 sherpa-onnx | ✅ 差異在「**只有本地**」 |
+| 文字注入 | 有 | 有 | ❌ 無差異 |
+| 熱鍵阻擋按鍵 | 有（`block_keys`） | 必須做 | ❌ 無差異（但證明必要性） |
+| LLM 整理／聊天／記憶／技能 | **有** | **明確不做** | ✅ 差異：更小、更可預測 |
+| 錄音檔 | **有保留**（3.3 MB） | 辨識後刪除 | ✅ **差異：隱私** |
+| 開源可稽核 | ❌ 閉源 | 可 | ✅ 差異：可稽核 |
+| 應用框架 | **Tauri** | 計畫選 Tauri | — |
+
+→ **VibeTalkie 的正當理由是：只做 ASR、完全本地、不留錄音、可稽核、不做 LLM 與記憶。**
+
+若這個理由成立，它就是一個**清楚的利基產品**，而不是重造一個功能更少的閃電說。
+**這件事必須由使用者確認**（見 §8.3），因為它決定整個專案是否值得做。
+
+> 📌 **對 P2/ADR 的附加價值：** 一個在完全相同利基上出貨的商業產品用 **Tauri** 打造。
+> 這是「Rust + Tauri 在本領域可行」的**實證**，比任何 benchmark 都有說服力。
+
+
 
