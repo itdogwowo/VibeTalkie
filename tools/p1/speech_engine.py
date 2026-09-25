@@ -59,18 +59,34 @@ class TranscriptResult:
 
 # ---------------------------------------------------------------- 音訊
 
+def pcm_to_samples(pcm: bytes) -> list[float]:
+    """PCM16 little-endian bytes → float 樣本 [-1, 1]。
+
+    錄音路徑拿到的是 bytes，檔案路徑拿到的是 float list。
+    先前只有檔案路徑做轉換，導致**麥克風路徑直接餵 bytes 給 sherpa-onnx**：
+        TypeError: accept_waveform(): incompatible function arguments
+    兩條路徑都必須經過這裡，才不會再次分岔。
+    """
+    n = len(pcm) // 2
+    if n == 0:
+        return []
+    s = struct.unpack(f"<{n}h", pcm[:n * 2])
+    return [v / 32768.0 for v in s]
+
+
 def read_wav(path: str | Path) -> tuple[list[float], int]:
-    """讀 16-bit PCM WAV → (float32 樣本 [-1,1], 取樣率)。立體聲會混成單聲道。"""
+    """讀 16-bit PCM WAV → (float 樣本 [-1,1], 取樣率)。立體聲會混成單聲道。"""
     with wave.open(str(path), "rb") as wf:
         rate, ch, width = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
         raw = wf.readframes(wf.getnframes())
     if width != 2:
         raise ValueError(f"只支援 16-bit WAV，{path} 是 {width * 8}-bit")
-    n = len(raw) // 2
-    s = struct.unpack(f"<{n}h", raw[:n * 2])
     if ch == 2:
+        n = len(raw) // 2
+        s = struct.unpack(f"<{n}h", raw[:n * 2])
         s = [(s[i] + s[i + 1]) / 2 for i in range(0, n - 1, 2)]
-    return [v / 32768.0 for v in s], rate
+        return [v / 32768.0 for v in s], rate
+    return pcm_to_samples(raw), rate
 
 
 # ---------------------------------------------------------------- 介面

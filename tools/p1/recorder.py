@@ -145,6 +145,78 @@ class Capture:
         return bool(self.hdr.dwFlags & WHDR_DONE)
 
 
+def capture_manual(device_id: int, rate: int = 16000, max_seconds: float = 120.0,
+                   show_meter: bool = True) -> dict:
+    """手動停止錄音：開始後一直錄，直到使用者按 Enter。
+
+    為什麼要有這個模式？
+        自動停止（靠 VAD 門檻）在實測中表現不好：8 段錄音有聲比例只有 9–33%，
+        而且會过早停止（某句 19 個字只錄到 0.24 秒語音）。
+        原廠工具的做法也是「按鍵開始 → 停止」的手動流程。
+        手動停止把不可靠的門檻判斷從關鍵路徑上拿掉。
+
+    音量表跑在背景執行緒，所以在等 Enter 的時候仍然看的到有沒有收到聲音。
+    """
+    import threading
+
+    with Capture(device_id, rate=rate, max_seconds=max_seconds) as cap:
+        stop = threading.Event()
+        peak = 0
+
+        def watch() -> None:
+            nonlocal peak
+            last = 0
+            while not stop.is_set():
+                data = cap.recorded()
+                if len(data) > last:
+                    new = data[last - (last % 2):]
+                    last = len(data)
+                    n = len(new) // 2
+                    if n:
+                        s = struct.unpack(f"<{n}h", new[:n * 2])
+                        rms = (sum(v * v for v in s) / n) ** 0.5
+                        peak = max(peak, max(abs(v) for v in s))
+                        if show_meter:
+                            print(f"\r  [{meter(rms)}] {rms:7.1f}", end="", flush=True)
+                time.sleep(0.05)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            input("  🎤 錄音中… 說完按 Enter 停止")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        stop.set()
+        watcher.join(timeout=0.5)
+        if show_meter:
+            print("\r" + " " * 50 + "\r", end="", flush=True)
+        pcm = cap.recorded()
+
+    return _summarize(pcm, rate, peak, timed_out=len(pcm) < rate // 5)
+
+
+def _summarize(pcm: bytes, rate: int, peak: int, timed_out: bool) -> dict:
+    import math
+
+    n = len(pcm) // 2
+    db = float("-inf")
+    if n:
+        s = struct.unpack(f"<{n}h", pcm[:n * 2])
+        rms = (sum(v * v for v in s) / n) ** 0.5
+        db = 20.0 * math.log10(rms / 32768.0) if rms > 0 else float("-inf")
+    adb, aratio, asec = active_level(pcm, rate)
+    return {
+        "pcm": pcm,
+        "duration_s": n / rate,
+        "speech_db": db,          # 整段平均（會被靜音拉低，僅供對照）
+        "active_db": adb,         # 有聲段落實際音量（要看這個）
+        "active_ratio": aratio,
+        "active_s": asec,
+        "peak": peak,
+        "timed_out": timed_out,
+    }
+
+
 def capture_utterance(device_id: int, rate: int = 16000, max_seconds: float = 15.0,
                       silence_stop_s: float = 0.7, min_speech_s: float = 0.35,
                       onset_timeout_s: float = 6.0, show_meter: bool = True) -> dict:

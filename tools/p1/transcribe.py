@@ -74,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--language", default=None, help="zh / en / ja / ko / yue / auto")
     parser.add_argument("--status", action="store_true", help="列出引擎狀態後結束")
     parser.add_argument("--loop", action="store_true", help="連續錄，Ctrl+C 結束")
+    parser.add_argument("--stop", choices=("enter", "auto"), default="enter",
+                        help="停止方式：enter=手動按 Enter（預設，較可靠）；"
+                             "auto=偵測靜音自動停止")
     parser.add_argument("--threads", type=int, default=2)
     args = parser.parse_args(argv)
     setup_console()
@@ -103,7 +106,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_once(engine, args, Path(args.file))
 
     print(f"錄音裝置 index={args.device}　（Ctrl+C 結束）")
-    print("按 Enter 開始錄一句；說完停一下會自動停止。\n")
+    if args.stop == "enter":
+        print("按 Enter 開始錄音 → 說完再按 Enter 停止（預設手動，較可靠）。\n")
+    else:
+        print("按 Enter 開始錄音 → 說完停一下會自動停止（--stop auto）。\n")
     while True:
         try:
             input("按 Enter 開始錄音…")
@@ -121,20 +127,31 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def record_and_transcribe(engine, args) -> int:
-    from recorder import capture_utterance
+    from recorder import capture_manual, capture_utterance
 
     try:
-        res = capture_utterance(args.device, rate=args.rate)
+        if args.stop == "enter":
+            res = capture_manual(args.device, rate=args.rate)
+        else:
+            res = capture_utterance(args.device, rate=args.rate)
     except Exception as exc:
         print(f"  ❌ 錄音失敗：{exc}")
         return 1
 
     if res["timed_out"] or res["duration_s"] < 0.2:
-        print("  ⚠️ 沒偵測到說話。")
+        print("  ⚠️ 沒錄到東西。")
         return 0
 
-    print(f"  錄到 {res['duration_s']:.2f}s，峰值 {res['peak']}/32767，辨識中…")
-    return _emit(engine, res["pcm"], args.rate, args)
+    adb = res.get("active_db", res["speech_db"])
+    ratio = res.get("active_ratio", 0.0)
+    print(f"  錄到 {res['duration_s']:.2f}s，說話 {adb:+.1f} dBFS"
+          f"（有聲 {ratio * 100:.0f}%），峰值 {res['peak']}/32767，辨識中…")
+    if adb < -42:
+        print("  ⚠️ 說話音量偏低，模型可能回空字串。請靠近麥克風、正常音量。")
+    # 錄音拿到的是 PCM bytes，必須轉成 float 樣本才能餵引擎
+    # （先前漏了這步 → accept_waveform TypeError）
+    from speech_engine import pcm_to_samples
+    return _emit(engine, pcm_to_samples(res["pcm"]), args.rate, args)
 
 
 def run_once(engine, args, path: Path) -> int:
