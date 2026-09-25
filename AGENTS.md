@@ -138,15 +138,15 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 **規則 2：必須能分辨「這顆鍵是不是目標裝置送的」。**
 使用者的實體鍵盤也有 Right Ctrl。**不區分裝置的話，按實體鍵盤的 Ctrl 也會觸發錄音。**
 
-實作限制（沒有現成解法）：
+實作方式（**已在 Python 驗證，`tools/p1/ptt.py`**）：
 
-| 機制 | 可抑制 | 可辨識裝置 |
+| 需求 | 機制 | 需要低階 hook 嗎 |
 |---|---|---|
-| Raw Input | ❌ | ✅ |
-| `global-hotkey` / `pynput` / `robotgo` | ❌ 或部分 | ❌ |
-| 低階 keyboard hook 回傳非 0 | ✅ | ❌ **hook 沒有裝置欄位** |
+| 偵測目標裝置的 Right Ctrl | **Raw Input 單通道**（同時給 `hDevice` 與 `E0` 旗標） | ❌ 不需要 |
+| 抑制按鍵（可選） | 低階 hook 回傳非 0 | ✅ 需要 |
 
-→ 必須**雙通道**：低階 hook 負責抑制、Raw Input 負責辨識裝置，靠時間戳關聯。
+→ **`WH_KEYBOARD_LL` 看不到裝置**（`KBDLLHOOKSTRUCT` 沒有裝置欄位），
+所以它不可能用來辨識裝置。先前寫的「必須雙通道」是被抑制需求帶偏的結論，已更正。
 
 **規則 3：熱鍵層要自己維護修飾鍵狀態機。**
 錄音鍵是**單獨一顆修飾鍵**。註冊式函式庫（`global-hotkey` 等）以「組合鍵」為單位，
