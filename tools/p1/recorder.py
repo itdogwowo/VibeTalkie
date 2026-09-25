@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""P1 錄音輔助：即時音量表 + 說話完自動停止。
+
+為什麼不直接用 P0 的 `record_wav.py`？
+    固定秒數錄音會把大段靜音也錄進去。SenseVoice 這類模型遇到長靜音
+    容易產生幻覺輸出，而且會拖長延遲。這裡改成：
+      1. 先用前 0.5 秒估底噪，再據此定說話門檻（自適應，不寫死）
+      2. 偵測到說話後，安靜超過 0.7 秒就自動停止
+      3. **即時顯示音量表** —— 使用者回報「系統裡看不到輸入音量」，
+         所以在終端機自己畫一個，才知道有沒有收到聲音
+
+底層沿用 `tools/p0/record_wav.py` 已驗證過的 winmm waveIn 設定。
+"""
+
+from __future__ import annotations
+
+import ctypes
+import struct
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "p0"))
+
+from record_wav import (  # noqa: E402
+    CALLBACK_NULL,
+    HWAVEIN,
+    WAVEHDR,
+    WHDR_DONE,
+    WAVEFORMATEX,
+    err_name,
+    make_format,
+    winmm,
+)
+
+
+def speech_thresh(noise_floor: float) -> float:
+    """說話門檻：底噪的 2.5 倍，但有下限。
+
+    下限取 25 是因為實測這支麥克風偏小聲：某次正常說話的整體 RMS 只有 33.5，
+    門檻若訂在 60 就會完全偵測不到。
+    """
+    return max(noise_floor * 2.5, 25.0)
+
+
+def meter(rms: float, width: int = 30) -> str:
+    """把 RMS 畫成條狀圖（滿刻度 32768）。"""
+    import math
+    if rms <= 0:
+        return " " * width
+    db = 20.0 * math.log10(rms / 32768.0)
+    # 映射 -60..0 dBFS 到 0..width
+    frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
+    filled = int(frac * width)
+    return "█" * filled + "·" * (width - filled)
+
+
+class Capture:
+    """一次性的 waveIn 擷取（開啟 → 啟動 → 輪詢 → 關閉）。"""
+
+    def __init__(self, device_id: int, rate: int = 16000, channels: int = 1,
+                 bits: int = 16, max_seconds: float = 15.0):
+        self.device_id = device_id
+        self.fmt = make_format(rate, channels, bits)
+        self.rate = rate
+        self.max_bytes = int(self.fmt.nAvgBytesPerSec * max_seconds)
+        self.buf = ctypes.create_string_buffer(self.max_bytes)
+        self.hdr = WAVEHDR()
+        self.hwi = HWAVEIN()
+        self._open = False
+
+    def __enter__(self) -> "Capture":
+        rc = winmm.waveInOpen(ctypes.byref(self.hwi), self.device_id,
+                              ctypes.byref(self.fmt), None, None, CALLBACK_NULL)
+        if rc != 0:
+            raise RuntimeError(f"waveInOpen 失敗：{err_name(rc)}")
+        self._open = True
+        self.hdr.lpData = ctypes.cast(self.buf, ctypes.c_void_p)
+        self.hdr.dwBufferLength = self.max_bytes
+        for fn, name in ((winmm.waveInPrepareHeader, "PrepareHeader"),
+                         (winmm.waveInAddBuffer, "AddBuffer")):
+            rc = fn(self.hwi, ctypes.byref(self.hdr), ctypes.sizeof(WAVEHDR))
+            if rc != 0:
+                raise RuntimeError(f"waveIn{name} 失敗：{err_name(rc)}")
+        rc = winmm.waveInStart(self.hwi)
+        if rc != 0:
+            raise RuntimeError(f"waveInStart 失敗：{err_name(rc)}")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if not self._open:
+            return
+        winmm.waveInStop(self.hwi)
+        winmm.waveInReset(self.hwi)
+        winmm.waveInUnprepareHeader(self.hwi, ctypes.byref(self.hdr), ctypes.sizeof(WAVEHDR))
+        winmm.waveInClose(self.hwi)
+        self._open = False
+
+    def recorded(self) -> bytes:
+        got = int(self.hdr.dwBytesRecorded)
+        got -= got % self.fmt.nBlockAlign
+        return self.buf.raw[:got]
+
+    @property
+    def done(self) -> bool:
+        return bool(self.hdr.dwFlags & WHDR_DONE)
+
+
+def capture_utterance(device_id: int, rate: int = 16000, max_seconds: float = 15.0,
+                      silence_stop_s: float = 0.7, min_speech_s: float = 0.35,
+                      onset_timeout_s: float = 6.0, show_meter: bool = True) -> dict:
+    """錄一句話：等到有人聲 → 安靜一段時間後自動停。
+
+    回傳 dict：pcm、duration_s、speech_db、noise_db、peak、timed_out。
+    """
+    import math
+
+    chunk = int(rate * 0.05) * 2          # 50 ms 的 byte 數（16-bit mono）
+    noise_floor = None
+    noise_samples: list[float] = []
+    spoke = False
+    last_voice = None
+    speech_start = None
+    peak = 0
+    onset_deadline = None
+
+    with Capture(device_id, rate=rate, max_seconds=max_seconds) as cap:
+        t_start = time.monotonic()
+        onset_deadline = t_start + onset_timeout_s
+        last_len = 0
+
+        while True:
+            data = cap.recorded()
+            if len(data) > last_len:
+                new = data[last_len - (last_len % 2):]
+                last_len = len(data)
+                if new:
+                    n = len(new) // 2
+                    s = struct.unpack(f"<{n}h", new[:n * 2])
+                    rms = (sum(v * v for v in s) / n) ** 0.5
+                    peak = max(peak, max(abs(v) for v in s))
+                    now = time.monotonic()
+
+                    if noise_floor is None:
+                        noise_samples.append(rms)
+                        if now - t_start >= 0.5:
+                            # 用中位數而不是平均：平均會被一聲咳嗽或碰撞拉高，
+                            # 導致門檻訂太高、安靜的說話反而偵測不到。
+                            srt = sorted(noise_samples)
+                            med = srt[len(srt) // 2]
+                            noise_floor = max(med, 3.0)
+                            if show_meter:
+                                print(f"\r  底噪 RMS {noise_floor:6.1f}"
+                                      f"（門檻 {speech_thresh(noise_floor):6.1f}）",
+                                      flush=True)
+                    else:
+                        thresh = speech_thresh(noise_floor)
+                        if rms > thresh:
+                            if not spoke:
+                                spoke = True
+                                speech_start = now
+                            last_voice = now
+                        if show_meter:
+                            tag = "🎤" if rms > thresh else "  "
+                            print(f"\r  {tag} [{meter(rms)}] {rms:7.1f}", end="", flush=True)
+
+                    if spoke and last_voice and (now - last_voice) > silence_stop_s:
+                        if (last_voice - speech_start) >= min_speech_s:
+                            break
+                    if not spoke and now > onset_deadline:
+                        break
+
+            if cap.done or time.monotonic() - t_start > max_seconds:
+                break
+            time.sleep(0.02)
+
+        pcm = cap.recorded()
+
+    if show_meter:
+        print("\r" + " " * 60 + "\r", end="", flush=True)
+
+    n = len(pcm) // 2
+    speech_db = float("-inf")
+    if n:
+        s = struct.unpack(f"<{n}h", pcm[:n * 2])
+        rms = (sum(v * v for v in s) / n) ** 0.5
+        speech_db = 20.0 * math.log10(rms / 32768.0) if rms > 0 else float("-inf")
+
+    return {
+        "pcm": pcm,
+        "duration_s": n / rate,
+        "speech_db": speech_db,
+        "noise_floor": noise_floor or 0.0,
+        "peak": peak,
+        "timed_out": not spoke,
+    }

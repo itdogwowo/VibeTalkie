@@ -37,3 +37,10 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ---- P1：以 wheel 直接解開的第三方套件與下載快取 ----
+third_party/
+wheels/
+model_downloads/
+.piptmp/
+
