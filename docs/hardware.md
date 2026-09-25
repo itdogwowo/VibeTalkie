@@ -69,7 +69,7 @@ HID 列舉樹下存在三個 collection：
 一般鍵盤 API（`WH_KEYBOARD_LL`、`RegisterHotKey`、`global-hotkey`）**可能完全看不到**，
 熱鍵層就必須改用 Raw Input 或 HID API。三棧的「全域熱鍵」評分直接受此影響。
 
-### 3.1 Raw Input 實測（T3 前置，**已量測**）
+### 3.1 Raw Input 實測（**已量測**）
 
 用 `tools/p0/keycode_logger.py --list-devices --filter 00001124` 實測，
 本裝置向 Raw Input 註冊了 **2 個** top-level collection：
@@ -82,10 +82,53 @@ HID 列舉樹下存在三個 collection：
 
 **這件事的意義：** 裝置同時暴露「標準鍵盤」與「Consumer Control」兩種介面，
 所以按鈕落在哪一邊**決定了熱鍵層能不能用現成的全域熱鍵函式庫**。
-兩種情形都可能，**必須靠 T3 實際按鍵才能定案**。
 （Col03 未註冊成 raw input，代表它很可能不是輸入用 collection，或 only-feature/report 通道；
 v1 不要依賴它。）
 
+### 3.2 T3 第一次擷取（**未定案**）
+
+第一次擷取（51 筆事件，`artifacts/t3-keycodes.jsonl`）的結果：
+
+**已確定的部分 — 裝置確實是一顆可用的 HID 鍵盤：**
+
+藍牙 HID 鍵盤 collection（`…&Col01`）送出了標準鍵盤事件，每次都是乾淨的
+1 按下 / 1 放開，VK 碼正確：
+
+| 鍵 | VK | 按下 | 放開 |
+|---|---|---|---|
+| `VK_LEFT` | 0x25 | 2 | 2 |
+| `VK_RETURN` | 0x0D | 1 | 1 |
+| `VK_BACK` | 0x08 | 1 | 1 |
+| `VK_DOWN` | 0x28 | 1 | 1 |
+| `VK_UP` | 0x26 | 1 | 1 |
+| `Z` | 0x5A | 1 | 1 |
+
+→ **假設 2 的「裝置是 HID 鍵盤」部分成立**，且事件落在 Col01（鍵盤 collection），
+不是 Col02（Consumer Control）。這對熱鍵層是好消息。
+
+**未確定的部分 — 按鈕鍵碼：**
+
+這次擷取**不符合 P0 協定**（擷取期間有其他打字混入），而且出現一個**未解的異常**：
+
+- Low-Level Hook 看到 **18 次 `VK_RCONTROL` 按下**，且帶有明顯的自動重複節奏
+  （首次按下後約 500 ms 起、每約 30 ms 一次），分成兩段：
+  t≈11.9 s 按住約 0.6 秒、t≈27.1 s 按住約 0.85 秒。
+- 但 Raw Input **只看到 2 次 `VK_CONTROL` 放開**（來自 `BT-HID/Col01`），
+  **完全沒有對應的按下**。
+
+**兩種可能讀法（都還不能採信）：**
+
+1. 按鈕送的是 **Right Ctrl（`VK_RCONTROL`）**，被按住約 0.6–0.85 秒 ——
+   這符合「按住說話」的行為，但 Raw Input 缺按下事件無法解釋。
+2. 這些 Ctrl 事件與按鈕無關（例如修飾鍵狀態殘留），按鈕其實還沒被測到。
+
+**若讀法 1 成立，這是重大架構影響：** 按鈕是**修飾鍵**，則
+`global-hotkey`（Rust）、`pynput`（Python）、`robotgo`（Go）**都不支援單一修飾鍵當熱鍵**，
+三棧的熱鍵層都必須自己寫 Low-Level Hook / Raw Input；
+而且「按住 Ctrl 期間」會改寫其他按鍵語意，並與 `Ctrl+V` 注入**直接衝突**。
+這會讓 `plan.md` §6 評分表中「全域熱鍵」那 25% 的評分方式整個改變。
+
+**下一步（必須重測）：** 見 §6 待辦 T3。
 
 ---
 
@@ -94,7 +137,7 @@ v1 不要依賴它。）
 | # | 假設 | 狀態 | 證據 / 待辦 |
 |---|---|---|---|
 | 1 | 麥克風以標準藍牙音訊輸入裝置出現在系統 | ✅ **已確認** | 捕獲端點 `AI_VOICE_MAX Hands-Free`，ACTIVE；且是 waveIn 裝置 `[1]` |
-| 2 | 按鍵是 HID 鍵盤，按下送鍵碼、放開停止 | 🟡 **部分確認** | HID profile 已綁定；Raw Input 看到 **Col01 鍵盤(154鍵) + Col02 Consumer Control**；**但鍵碼本身未量測** → 跑 T3 |
+| 2 | 按鍵是 HID 鍵盤，按下送鍵碼、放開停止 | 🟡 **部分確認** | Col01 確實送出乾淨的標準鍵盤事件（見 §3.2）；**但「按鈕」本身的鍵碼尚未定案**（第一次擷取有異常）→ 重測 T3 |
 | 3 | 裝置本身**不**內建辨識直接打字 | ⏳ **待驗證** | 記事本按鍵，觀察是否自行冒字 → 跑 T4 |
 | 4 | 麥克風支援 16 kHz 或可被系統重採樣 | 🟡 **初步正面** | 見下方 §4.1；尚未用語音確認 |
 
@@ -163,8 +206,10 @@ v1 不要依賴它。）
 
 - [x] T1 列舉音訊輸入裝置 → 已看到目標麥克風（registry + waveIn 雙重確認）
 - [x] 列出 Raw Input 的 HID collection → Col01 鍵盤 / Col02 Consumer Control
+- [x] T3 第一次擷取 → 確認 Col01 是可用鍵盤；但按鈕鍵碼**未定案**（有異常）
+- [ ] **T3 重測**：**不要碰鍵盤**，只按裝置按鈕 3 次（按下約 1 秒、放開），
+      然後回報 `--analyze` 的摘要。重點是確認「按下次數 == 3」且鍵碼一致
 - [ ] T2 用**語音 + 長音「ㄙ」**重錄，確認頻寬達 Nyquist（`record_wav.py`）
-- [ ] T3 記錄按鈕的真實鍵碼：usage page / usage id / VK / scan code（`keycode_logger.py`）
 - [ ] T4 記事本按鍵，確認裝置不會自行打字
 - [ ] 確認兩個名稱相近的藍牙節點中，哪一台是現役目標
 - [ ] 把以上結果回填本檔
@@ -178,7 +223,8 @@ v1 不要依賴它。）
 | P0 起始 | Profile / 端點列舉 | HFP + HID + SPP + vendor；捕獲端點 ACTIVE |
 | P0 起始 | Raw Input collection 列舉 | Col01 = 鍵盤(154 鍵)；Col02 = Consumer Control(page 0x0C)；Col03 未註冊成 raw input |
 | P0 起始 | 取樣率（環境底噪，3 秒） | 16 kHz mono 錄音成功；頻寬達 Nyquist 8000 Hz → 初步排除 8 kHz 窄頻，**待語音複驗** |
+| P0 起始 | T3 第一次擷取（51 筆） | Col01 送出 VK_LEFT/RETURN/BACK/UP/DOWN/Z（各 1 按 1 放）；**異常**：hook 見 18 次 VK_RCONTROL 自動重複、Raw Input 只見 2 次 Ctrl 放開無按下 → **未定案** |
+| — | T3 重測（乾淨協定） | ⏳ |
 | — | T2 語音複驗 | ⏳ |
-| — | T3 鍵碼 | ⏳ |
 | — | T4 自行打字 | ⏳ |
 
