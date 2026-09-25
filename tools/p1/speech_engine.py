@@ -329,6 +329,36 @@ def has_opencc() -> bool:
     return _S2T is not None
 
 
+# 「句號」不只一種寫法 —— 實際會遇到的至少這四種：
+#   。 U+3002 全形句號（中文最常用，模型輸出的就是這個）
+#   ． U+FF0E 全形句點
+#   .  U+002E 半形句點
+#   ｡ U+FF61 半形日文句號
+# 所以用字元集合處理，而不是比對單一字元。
+TRAILING_PERIODS = "。．.｡"
+
+
+def strip_trailing_period(text: str) -> str:
+    """移除結尾的句號（含連續多個、多種寫法、句號後面夾空白）。
+
+    使用者需求：講完一句話模型會在結尾補句號，輸入時還要自己刪很麻煩。
+    只處理**結尾**，不動句中的標點。
+
+    ⚠️ 順序很重要：必須「先清空白、再清句號」並**交替進行**。
+    只做一次 `rstrip(句號).rstrip()` 的話，`"你好。 "` 會變成 `"你好。"` ——
+    空白去掉了、句號卻還在（因為句號不在字串尾端）。
+    """
+    if not text:
+        return text
+    out = text
+    while True:
+        # 先清空白，再清句號；句號後面可能還有空白，所以要交替到穩定為止
+        nxt = out.rstrip().rstrip(TRAILING_PERIODS)
+        if nxt == out:
+            return out
+        out = nxt
+
+
 # ---------------------------------------------------------------- 註冊表
 
 ENGINES: dict[str, type[SpeechEngine]] = {

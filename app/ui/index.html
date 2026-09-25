@@ -112,9 +112,19 @@
       <div class="row"><span class="k">還原剪貼簿</span>
         <label class="switch"><input type="checkbox" checked disabled>
           <span>一律還原</span></label></div>
+      <div class="row"><span class="k">移除結尾句號</span>
+        <label class="switch"><input type="checkbox" id="noperiod">
+          <span>移除</span></label></div>
+      <div class="hint" style="margin:0 0 10px">
+        「句號」有多種寫法（<span class="kv">。．.｡</span>），全部都會移除；
+        只處理結尾，不動句中的標點。
+      </div>
       <div class="row">
         <button id="save">儲存設定</button>
         <span class="kv" id="saved" style="color:var(--ok)"></span>
+      </div>
+      <div class="hint" style="margin:12px 0 0">
+        以上設定**存檔後立即生效，不需要重啟**。
       </div>
     </div>
   </section>

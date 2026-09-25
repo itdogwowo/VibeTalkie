@@ -289,6 +289,7 @@ async function loadConfig() {
   const c = await api("/api/config");
   configCache = c;
   $("trad").checked = !!c.traditional;
+  $("noperiod").checked = c.remove_trailing_period !== false;
   $("mode").value = c.mode || "auto";
 
   // 麥克風用名稱當主要識別（索引會隨藍牙重連改變）
@@ -310,6 +311,7 @@ $("save").onclick = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         traditional: $("trad").checked,
+        remove_trailing_period: $("noperiod").checked,
         mode: $("mode").value,
         device_index: parseInt(sel.value, 10),
         mic_name: opt ? (opt.dataset.name || "") : "",

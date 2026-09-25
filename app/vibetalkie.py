@@ -134,7 +134,7 @@ class Status:
 
 # ---------------------------------------------------------------- 裝置解析
 
-def resolve_device(cfg: Config) -> tuple[int, str, list[dict]]:
+def resolve_device(cfg: Config, quiet: bool = False) -> tuple[int, str, list[dict]]:
     """把設定檔裡的麥克風**解析成目前的裝置索引**。
 
     ⚠️ 為什麼不能直接用 `device_index`？
@@ -148,7 +148,8 @@ def resolve_device(cfg: Config) -> tuple[int, str, list[dict]]:
     try:
         devs = [{"index": i, "name": n.strip()} for i, n, *_ in list_devices()]
     except Exception as exc:
-        print(f"⚠️ 列舉音訊裝置失敗：{exc}")
+        if not quiet:
+            print(f"⚠️ 列舉音訊裝置失敗：{exc}")
         return cfg.device_index, "", []
 
     if not devs:
@@ -162,16 +163,18 @@ def resolve_device(cfg: Config) -> tuple[int, str, list[dict]]:
         for d in devs:                                    # 開頭符合（名稱被截斷）
             if d["name"].lower().startswith(name.lower()[:20]):
                 return d["index"], d["name"], devs
-        print(f"⚠️ 設定檔指定的麥克風「{name}」目前不在清單中。")
-        print(f"   改用 index {cfg.device_index}："
-              f"{next((d['name'] for d in devs if d['index'] == cfg.device_index), '（不存在）')}")
-        print("   請在設定介面重新選擇麥克風。")
+        if not quiet:
+            print(f"⚠️ 設定檔指定的麥克風「{name}」目前不在清單中。")
+            print(f"   改用 index {cfg.device_index}："
+                  f"{next((d['name'] for d in devs if d['index'] == cfg.device_index), '（不存在）')}")
+            print("   請在設定介面重新選擇麥克風。")
         return cfg.device_index, "", devs
 
     # 還沒綁定名稱 → 嘗試認出本專案的目標裝置（見 docs/hardware.md §1）
     for d in devs:
         if any(h in d["name"] for h in TARGET_HINTS):
-            print(f"ℹ️ 尚未綁定麥克風，自動認出目標裝置：{d['name']}")
+            if not quiet:
+                print(f"ℹ️ 尚未綁定麥克風，自動認出目標裝置：{d['name']}")
             return d["index"], d["name"], devs
 
     return cfg.device_index, "", devs
@@ -369,12 +372,13 @@ def make_handler(status: Status):
                 return self._json({"error": f"bad json: {exc}"}, 400)
 
             cfg = status.cfg
-            for k in ("traditional", "mode", "device_index", "language", "mic_name"):
+            for k in ("traditional", "mode", "device_index", "language", "mic_name",
+                      "remove_trailing_period"):
                 if k in patch:
                     setattr(cfg, k, patch[k])
             path = cfg.save()
             self._json({"ok": True, "saved": str(path),
-                        "note": "部分設定需要重新啟動 VibeTalkie 才生效"})
+                        "note": "裝置、輸出入方式與句號設定都會立即生效，不必重啟"})
 
         # ---- 模型 ----
         def _body(self) -> dict:
@@ -530,12 +534,17 @@ def main(argv: list[str] | None = None) -> int:
         engine,
         device_filter="00001124",
         traditional=cfg.traditional,
+        remove_period=cfg.remove_trailing_period,
         mode=cfg.mode,
         dry_run=args.dry_run,
         device_index=dev_index,
         debug=args.debug,
         on_state=status.on_state,
         on_result=status.on_result,
+        # 每次錄音都重新解析裝置 → 在設定介面換麥克風之後**不必重啟**
+        device_provider=lambda: resolve_device(cfg, quiet=True)[0],
+        # 即時讀設定 → 改「繁體輸出／移除句號／注入方式」也不必重啟
+        cfg_provider=lambda: cfg,
     )
     status.daemon = daemon
 

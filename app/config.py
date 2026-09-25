@@ -38,6 +38,7 @@ class Config:
     mode: str = "auto"                  # auto | paste | type
     traditional: bool = True            # SenseVoice 輸出簡體 → 台灣要繁體
     restore_clipboard: bool = True
+    remove_trailing_period: bool = True  # 模型會在結尾補句號，輸入時很礙事
 
     # [privacy]
     delete_audio_after: bool = True     # 音訊只在記憶體，不落地
@@ -86,7 +87,8 @@ class Config:
         sections = {
             "device": ("device_index", "mic_name", "hotkey"),
             "asr": ("engine", "model_dir", "language", "threads"),
-            "output": ("mode", "traditional", "restore_clipboard"),
+            "output": ("mode", "traditional", "restore_clipboard",
+                       "remove_trailing_period"),
             "privacy": ("delete_audio_after",),
             "ui": ("port", "open_browser"),
         }
@@ -109,6 +111,7 @@ class Config:
             "mic_name": self.mic_name,
             "mode": self.mode,
             "traditional": self.traditional,
+            "remove_trailing_period": self.remove_trailing_period,
             "engine": self.engine,
             "language": self.language,
         }
@@ -142,6 +145,7 @@ threads = 2
 mode = "auto"
 traditional = true
 restore_clipboard = true
+remove_trailing_period = true
 
 [privacy]
 delete_audio_after = true

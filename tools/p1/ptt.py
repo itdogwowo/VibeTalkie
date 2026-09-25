@@ -67,6 +67,7 @@ from speech_engine import (  # noqa: E402
     build_engine,
     has_opencc,
     pcm_to_samples,
+    strip_trailing_period,
     to_traditional,
 )
 from textin import inject_text  # noqa: E402
@@ -84,17 +85,23 @@ class PttDaemon:
                  traditional: bool = True, mode: str = "auto",
                  dry_run: bool = False, min_s: float = 0.2,
                  max_s: float = 60.0, device_index: int = 1, debug: bool = False,
-                 on_state=None, on_result=None):
+                 on_state=None, on_result=None, device_provider=None,
+                 remove_period: bool = True, cfg_provider=None):
         self.engine = engine
         self.device_filter = device_filter.lower() if device_filter else None
         self.key_vk = key_vk
         self.require_e0 = require_e0
         self.traditional = traditional
+        self.remove_period = remove_period
         self.mode = mode
         self.dry_run = dry_run
         self.min_s = min_s
         self.max_s = max_s
         self.device_index = device_index
+        # 每次錄音時重新解析裝置，讓「切換麥克風」不必重啟程式。
+        # 傳 None 就用固定的 device_index（純終端機模式）。
+        self.device_provider = device_provider
+        self.cfg_provider = cfg_provider
         self.debug = debug
         # 給 UI 用的回呼（可選）。不傳就只是純終端機模式。
         self.on_state = on_state
@@ -115,6 +122,22 @@ class PttDaemon:
         self._last_unknown_dev: dict[int, dict] = {}
 
     # ------------------------------------------------ 裝置判定
+    def current_device(self) -> int:
+        """現在要用的錄音裝置索引。
+
+        每次錄音都重新問一次 —— 使用者在設定介面換麥克風之後**不必重啟**。
+        設定檔變更、裝置重新連線（藍牙斷了又回來）都會在這裡反映出來。
+        """
+        if self.device_provider is not None:
+            try:
+                idx = self.device_provider()
+                if isinstance(idx, int) and idx >= 0:
+                    self.device_index = idx
+            except Exception as exc:
+                if self.debug:
+                    print(f"  · 解析錄音裝置失敗，沿用 index {self.device_index}：{exc}")
+        return self.device_index
+
     def _is_target_device(self, hdevice) -> tuple[bool, str]:
         key = int(hdevice or 0)
         info = self._last_unknown_dev.get(key)
@@ -127,6 +150,25 @@ class PttDaemon:
         if self.device_filter in name.lower():
             return True, device_label(name)
         return False, device_label(name)
+
+    def _live(self) -> dict:
+        """即時讀取設定。
+
+        有 `cfg_provider` 就每次重新問 —— 這樣在 UI 改「繁體輸出／移除句號／
+        注入方式」之後**不必重啟**。沒有 provider（純終端機模式）就用建構時的值。
+        """
+        fallback = {"traditional": self.traditional,
+                    "remove_period": self.remove_period,
+                    "mode": self.mode}
+        if self.cfg_provider is None:
+            return fallback
+        try:
+            c = self.cfg_provider()
+            return {"traditional": bool(getattr(c, "traditional", True)),
+                    "remove_period": bool(getattr(c, "remove_trailing_period", True)),
+                    "mode": getattr(c, "mode", "auto") or "auto"}
+        except Exception:
+            return fallback
 
     # ------------------------------------------------ 錄音 / 辨識 / 注入
     def _set_state(self, state: str) -> None:
@@ -159,7 +201,7 @@ class PttDaemon:
 
     def _start_recording(self, label: str) -> None:
         try:
-            cap = Capture(self.device_index, rate=16000, max_seconds=self.max_s)
+            cap = Capture(self.current_device(), rate=16000, max_seconds=self.max_s)
             cap.__enter__()
         except Exception as exc:
             print(f"  ❌ 無法開始錄音：{exc}")
@@ -224,7 +266,16 @@ class PttDaemon:
             self._set_state("IDLE")
             return
 
-        out = to_traditional(text) if (self.traditional and has_opencc()) else text
+        live = self._live()
+        out = to_traditional(text) if (live["traditional"] and has_opencc()) else text
+        if live["remove_period"]:
+            out = strip_trailing_period(out)
+            if not out:
+                # 整句只有句號（模型聽到雜音時會這樣）→ 當成空結果，不要注入
+                print("  ⚠️ 移除結尾句號後沒有內容，不注入")
+                self.stats["empty"] += 1
+                self._set_state("IDLE")
+                return
         print(f"  📝 {out}   （辨識 {asr_ms:.0f} ms）")
 
         if self.dry_run:
@@ -233,7 +284,7 @@ class PttDaemon:
             return
 
         self._set_state("INSERTING")
-        res = inject_text(out, mode=self.mode, verbose=True)
+        res = inject_text(out, mode=live["mode"], verbose=True)
         if res["ok"]:
             self.stats["inserted"] += 1
             print(f"  ✅ 已注入（{res['method']}）"
@@ -375,7 +426,7 @@ class PttDaemon:
         try:
             print(f"  ⏳ 暖機麥克風（等藍牙音訊連線，最多 {timeout:.0f}s）…",
                   end="", flush=True)
-            cap = Capture(self.device_index, rate=16000, max_seconds=timeout + 2.0)
+            cap = Capture(self.current_device(), rate=16000, max_seconds=timeout + 2.0)
             cap.__enter__()
             t0 = time.monotonic()
             first: float | None = None

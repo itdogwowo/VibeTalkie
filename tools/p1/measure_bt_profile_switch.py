@@ -121,46 +121,53 @@ def diff(a: dict, b: dict) -> list[str]:
     return lines
 
 
-def monitor(device: int, hold: float, poll: float = 0.15) -> tuple[dict, list[str]]:
-    """開著麥克風並持續輪詢端點狀態，回傳 (開啟前的快照, 轉變事件)。
+def monitor(device: int, hold: float, poll: float = 0.1) -> tuple[dict, list[str], dict]:
+    """開著麥克風並持續輪詢端點狀態，回傳 (開啟前的快照, 轉變事件, 時間統計)。
 
     ⚠️ registry 的 DeviceState **不是即時的**。實測：開著串流時讀到 UNPLUGGED，
     關掉之後又自己回到 ACTIVE —— 那是音訊服務還沒把狀態寫回去，不是真的斷線。
-    所以這裡改成**持續輪詢並記錄每一次轉變**，用轉變的方向與時序判斷，
-    而不是只比對頭尾兩張快照。
+    所以這裡改成**持續輪詢並記錄每一次轉變**，用轉變的方向與時序判斷。
+
+    時間統計會明確分開「擷取開始→中斷」與「擷取結束→恢復」兩段，
+    因為使用者感受到的是這兩段的長度。
     """
     before = snapshot()
     events: list[str] = []
     prev = before
     t0 = time.time()
+    timing: dict = {}
 
-    cap = Capture(device, rate=16000, max_seconds=hold + 5)
-    cap.__enter__()
-    try:
-        while time.time() - t0 < hold:
-            time.sleep(poll)
-            cur = snapshot()
-            for guid, val in cur.items():
-                old = prev.get(guid)
-                if old != val:
-                    events.append(f"  t+{time.time() - t0:5.2f}s  {val}"
-                                  + (f"   ← 原本 {old}" if old else ""))
-            prev = cur
-    finally:
-        cap.__exit__(None, None, None)
-
-    # 關閉後再追蹤一段，看有沒有切回來
-    t1 = time.time()
-    while time.time() - t1 < 2.0:
-        time.sleep(poll)
+    def watch(mark: bool = False) -> None:
+        nonlocal prev
         cur = snapshot()
         for guid, val in cur.items():
             old = prev.get(guid)
             if old != val:
-                events.append(f"  t+{time.time() - t0:5.2f}s（已放開）{val}"
+                rel = time.time() - t0
+                tag = "（已放開）" if mark else ""
+                events.append(f"  t+{rel:5.2f}s {tag}{val}"
                               + (f"   ← 原本 {old}" if old else ""))
         prev = cur
-    return before, events
+
+    cap = Capture(device, rate=16000, max_seconds=hold + 6)
+    cap.__enter__()
+    timing["t_open"] = time.time() - t0
+    try:
+        while time.time() - t0 < hold:
+            time.sleep(poll)
+            watch()
+    finally:
+        cap.__exit__(None, None, None)
+    timing["t_close"] = time.time() - t0
+
+    # 放開之後追蹤到耳機回來（或逾時）
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        time.sleep(poll)
+        watch(mark=True)
+
+    timing["events"] = list(events)
+    return before, events, timing
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,14 +196,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[裝置 {dev}] {name}　開 {args.hold:g} 秒")
         print("=" * 78)
         try:
-            before, events = monitor(dev, args.hold)
+            before, events, timing = monitor(dev, args.hold)
         except Exception as exc:
             print(f"  ❌ 失敗：{type(exc).__name__}: {exc}")
             continue
+        print(f"\n  擷取區間：開 t+{timing['t_open']:.2f}s → 關 t+{timing['t_close']:.2f}s"
+              f"（按住 {args.hold:g} 秒）")
         if events:
             print("\n  偵測到的端點狀態轉變：")
             for e in events:
                 print(e)
+            # 把兩段延遲單獨算出來 —— 使用者感覺到的就是這兩段
+            first_cut = next((e for e in events if "UNPLUGGED" in e and "已放開" not in e), None)
+            first_back = next((e for e in events
+                               if "已放開" in e and "[ACTIVE]" in e), None)
+            print()
+            if first_cut:
+                t = float(first_cut.split("t+")[1].split("s")[0])
+                print(f"  按下 → 中斷：約 {(t - timing['t_open']) * 1000:.0f} ms")
+            if first_back:
+                t = float(first_back.split("t+")[1].split("s")[0])
+                print(f"  放開 → 恢復：約 {(t - timing['t_close']) * 1000:.0f} ms"
+                      f"　← 這就是你聽到「放開後又斷一下」的長度")
         else:
             print("\n  期間沒有任何端點狀態轉變。")
 
