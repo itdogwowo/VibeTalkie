@@ -109,7 +109,7 @@ function render(s) {
   }
 
   // 警告
-  const warns = [s.vendor_warning, s.mic_warning].filter(Boolean);
+  const warns = [s.vendor_warning, s.mic_warning, s.bt_warning].filter(Boolean);
   $("warnbox").style.display = warns.length ? "block" : "none";
   $("warnbox").innerHTML = warns.map(w => `<div>⚠️ ${esc(w)}</div>`).join("");
 

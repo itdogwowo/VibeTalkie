@@ -65,6 +65,7 @@ class Status:
         self.latency: dict | None = None
         self.vendor_warning: str | None = None
         self.mic_warning: str | None = None
+        self.bt_warning: str | None = None
         self.engine_name = cfg.engine
         self.model_name = ""
         self.error: str | None = None
@@ -101,6 +102,7 @@ class Status:
                 "latency": self.latency,
                 "vendor_warning": self.vendor_warning,
                 "mic_warning": self.mic_warning,
+                "bt_warning": self.bt_warning,
                 "engine": self.engine_name,
                 "model": self.model_name,
                 "error": self.error,
@@ -119,6 +121,7 @@ class Status:
             "paste_ms": lat.get("paste_ms"),
             "vendor_warning": d["vendor_warning"],
             "mic_warning": d["mic_warning"],
+            "bt_warning": d["bt_warning"],
             "engine": d["engine"],
             "model": d["model"],
             "error": d["error"],
@@ -193,6 +196,32 @@ def check_vendor_tool() -> str | None:
     except Exception:
         pass
     return None
+
+
+def check_bt_mic_warning(cfg: Config, devs: list[dict]) -> str | None:
+    """若設定的麥克風是藍牙裝置，警告它會干擾其他藍牙音訊。
+
+    實測（`docs/hardware.md` §2.2）：開藍牙麥克風會讓**同一顆藍牙控制器上
+    的其他裝置**（例如耳機）整個 UNPLUGGED，錄音期間完全沒聲音，放開後
+    約 0.4 秒才回來。這是控制器層級的資源衝突，程式修不掉。
+
+    對策只有兩個：換 USB／有線麥克風，或錄音時別聽藍牙耳機。
+    使用者不會自己知道這件事，所以一定要講。
+    """
+    name = ""
+    for d in devs:
+        if d["index"] == cfg.device_index:
+            name = d["name"]
+            break
+    name = name or cfg.mic_name or ""
+    # ⚠️ WAVEINCAPS 的名稱上限是 31 個字元，實測拿到的是
+    #    "Headset (AI_VOICE_MAX Hands-Fre" —— "Hands-Free" 被截成 "Hands-Fre"。
+    #    所以不能比對完整的 "hands-free"，要用共同的開頭。
+    if "hands-fre" not in name.lower():
+        return None
+    return ("你用的是藍牙麥克風。錄音期間，其他藍牙音訊裝置（例如耳機）"
+            "會暫時完全中斷、放開後才恢復 —— 這是藍牙控制器的資源限制，"
+            "不是程式問題。改用 USB 或有線麥克風可完全避免。")
 
 
 def pick_port(preferred: int) -> int:
@@ -492,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     status.model_name = cfg.model_dir
     status.vendor_warning = check_vendor_tool()
     status.mic_warning = mic_warning
+    status.bt_warning = check_bt_mic_warning(cfg, devs)
     status.engine = engine
     status.models = ModelManager(on_change=lambda: None)
     status.opencc = has_opencc()
