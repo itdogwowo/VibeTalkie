@@ -153,8 +153,17 @@ class PttDaemon:
         n = len(pcm) // 2
         secs = n / 16000
         print(f"  ⏹  停止（{duration:.1f}s，音訊 {secs:.2f}s）")
+        if n == 0:
+            # 實測：啟動後第一次按下常常收到 0 bytes。
+            # 藍牙 HFP 的 SCO 音訊連線要等串流真的開始才建立，
+            # 在那之前 waveIn 拿不到任何資料。第二次之後就正常。
+            print("  ⚠️ 完全沒收到音訊 —— 藍牙音訊連線可能還沒建立好（見啟動時的暖機）")
+            print("     請再按一次。若持續如此，用 --device-index 確認裝置索引。")
+            self.stats["failed"] += 1
+            self.state = "IDLE"
+            return
         if secs < self.min_s:
-            print("  ⏭  太短，視為誤觸，不辨識")
+            print(f"  ⏭  太短（{secs:.2f}s < {self.min_s}s），視為誤觸，不辨識")
             self.state = "IDLE"
             return
 
@@ -304,9 +313,49 @@ class PttDaemon:
         if not user32.RegisterRawInputDevices(devs, 1, ctypes.sizeof(RAWINPUTDEVICE)):
             raise ctypes.WinError(ctypes.get_last_error())
 
+    def warmup_audio(self, timeout: float = 6.0) -> float | None:
+        """先開麥克風，等到**真的收到音訊**為止，再關掉。
+
+        為什麼需要？
+            實測：程式啟動後**第一次**按下錄音鍵會收到 `音訊 0.00s`
+            （完全沒有資料），第二次之後就正常。
+            藍牙 HFP 的 SCO 音訊連線是在串流真的開始時才建立，
+            在那之前 waveIn 拿不到任何東西。
+
+            固定睡 0.8 秒實測還是不够（照樣 0 bytes），
+            所以改成**輪詢到有資料為止**，並把實測到的延遲印出來。
+
+        回傳首次收到音訊的秒數；逾時回 None。
+        """
+        try:
+            print(f"  ⏳ 暖機麥克風（等藍牙音訊連線，最多 {timeout:.0f}s）…",
+                  end="", flush=True)
+            cap = Capture(self.device_index, rate=16000, max_seconds=timeout + 2.0)
+            cap.__enter__()
+            t0 = time.monotonic()
+            first: float | None = None
+            while time.monotonic() - t0 < timeout:
+                if len(cap.recorded()) > 0:
+                    first = time.monotonic() - t0
+                    break
+                time.sleep(0.05)
+            cap.__exit__(None, None, None)
+        except Exception as exc:
+            print(f" 失敗：{exc}")
+            print("     錄音裝置可能被占用。若第一次按下收到 0 bytes，再按一次即可。")
+            return None
+
+        if first is None:
+            print(f" 逾時（{timeout:.0f}s 內沒收到任何音訊）")
+            print("     請確認裝置已連線、未被其他程式獨占（原廠工具要關掉）。")
+        else:
+            print(f" 完成，首次收到音訊花了 {first:.2f}s")
+        return first
+
     def run(self, seconds: float | None = None) -> None:
         self._hwnd = self._create_window()
         self._register()
+        self.warmup_audio()
         if self.debug:
             print(f"  (debug) 視窗 hwnd={int(self._hwnd or 0)}，raw input 已註冊"
                   f"（usage 0x01/0x06，RIDEV_INPUTSINK）")
