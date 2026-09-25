@@ -206,7 +206,13 @@ def inject_text(text: str, mode: str = "auto", restore_delay: float = 0.25,
         "type"   只用逐字輸入
         "auto"   先試貼上，失敗改用逐字輸入
 
-    回傳 dict：ok、method、clipboard_restored、detail
+    回傳 dict：ok、method、clipboard_restored、paste_ms、restore_ms、detail
+
+    ⚠️ 延遲的誤解：
+        `restore_delay` 預設 0.25 秒，是「送完 Ctrl+V 之後等目標程式讀走
+        剪貼簿，才還原」的等待。**使用者感覺不到這段** ——
+        文字在送出的當下就已經貼上去了。
+        所以「反應速度」要看 `paste_ms`，不是整個函式的耗時。
     """
     def log(msg: str) -> None:
         if verbose:
@@ -214,13 +220,15 @@ def inject_text(text: str, mode: str = "auto", restore_delay: float = 0.25,
 
     if not text:
         return {"ok": False, "method": None, "clipboard_restored": True,
-                "detail": "文字為空，未注入"}
+                "paste_ms": 0.0, "restore_ms": 0.0, "detail": "文字為空，未注入"}
 
     if mode == "type":
         release_modifiers()
         time.sleep(0.02)
+        t0 = time.perf_counter()
         n = type_unicode(text)
         return {"ok": n > 0, "method": "type", "clipboard_restored": True,
+                "paste_ms": (time.perf_counter() - t0) * 1000, "restore_ms": 0.0,
                 "detail": f"逐字輸入 {n} 個字元"}
 
     backup = get_clipboard_text()
@@ -228,16 +236,20 @@ def inject_text(text: str, mode: str = "auto", restore_delay: float = 0.25,
     if not set_clipboard_text(text):
         if mode == "paste":
             return {"ok": False, "method": "paste", "clipboard_restored": True,
+                    "paste_ms": 0.0, "restore_ms": 0.0,
                     "detail": "寫入剪貼簿失敗（可能被其他程式獨占）"}
         log("  ⚠️ 剪貼簿寫入失敗，改用逐字輸入")
         return inject_text(text, mode="type", verbose=verbose)
 
     release_modifiers()
     time.sleep(0.02)
+    t_paste = time.perf_counter()
     ok = send_ctrl_v()
-    # 給目標程式時間讀走剪貼簿，再還原
+    paste_ms = (time.perf_counter() - t_paste) * 1000
+    # 給目標程式時間讀走剪貼簿，再還原（這段使用者感覺不到）
     time.sleep(restore_delay)
 
+    t_restore = time.perf_counter()
     restored = True
     if had_backup:
         restored = set_clipboard_text(backup)   # type: ignore[arg-type]
@@ -248,15 +260,18 @@ def inject_text(text: str, mode: str = "auto", restore_delay: float = 0.25,
         if _open_clipboard():
             user32.EmptyClipboard()
             user32.CloseClipboard()
+    restore_ms = (time.perf_counter() - t_restore) * 1000
 
     if not ok and mode == "auto":
         log("  ⚠️ 貼上失敗，改用逐字輸入")
         fallback = inject_text(text, mode="type", verbose=verbose)
         return {"ok": fallback["ok"], "method": "type",
                 "clipboard_restored": restored,
+                "paste_ms": paste_ms, "restore_ms": restore_ms,
                 "detail": f"貼上失敗後逐字輸入：{fallback['detail']}"}
 
     return {"ok": ok, "method": "paste", "clipboard_restored": restored,
+            "paste_ms": paste_ms, "restore_ms": restore_ms,
             "detail": "剪貼簿貼上" + ("（剪貼簿已還原）" if had_backup else "（原本無文字）")}
 
 

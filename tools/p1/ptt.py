@@ -199,18 +199,21 @@ class PttDaemon:
             return
 
         self.state = "INSERTING"
-        t1 = time.perf_counter()
         res = inject_text(out, mode=self.mode, verbose=True)
-        ins_ms = (time.perf_counter() - t1) * 1000
         if res["ok"]:
             self.stats["inserted"] += 1
-            print(f"  ✅ 已注入（{res['method']}，{ins_ms:.0f} ms）"
+            print(f"  ✅ 已注入（{res['method']}）"
                   f"{'' if res['clipboard_restored'] else ' ⚠️ 剪貼簿未還原'}")
         else:
             self.stats["failed"] += 1
             print(f"  ❌ 注入失敗：{res['detail']}")
-        total = (time.perf_counter() - t0) * 1000
-        print(f"  ⏱  端到端（辨識+注入）{total:.0f} ms\n")
+
+        # 分開回報：使用者感覺到的是「放開 → 文字出現」，
+        # 也就是辨識 + 送出貼上；剪貼簿還原發生在之後，看不到。
+        perceived = asr_ms + res.get("paste_ms", 0.0)
+        print(f"  ⏱  放開→文字出現 {perceived:.0f} ms"
+              f"（辨識 {asr_ms:.0f} + 貼上 {res.get('paste_ms', 0):.0f}）"
+              f"，剪貼簿還原另計 {res.get('restore_ms', 0):.0f} ms\n")
         self.state = "IDLE"
 
     # ------------------------------------------------ Raw Input
