@@ -299,6 +299,7 @@ for ($i=0; $i -lt $b.Length; $i++) {
 
 ```powershell
 python app/test_status_contract.py       # UI ↔ /api/status 欄位契約
+python app/test_models_api.py            # 模型下載／切換 API
 python tools/p1/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
 python tools/p0/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）
 ```

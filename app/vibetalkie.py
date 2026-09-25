@@ -35,6 +35,8 @@ sys.path.insert(0, str(ROOT / "tools" / "p1"))
 sys.path.insert(0, str(ROOT / "tools" / "p0"))
 
 from config import Config  # noqa: E402
+import models  # noqa: E402
+from models import ModelManager  # noqa: E402
 from speech_engine import build_engine, has_opencc  # noqa: E402
 from ptt import PttDaemon  # noqa: E402
 from record_wav import list_devices, setup_console  # noqa: E402
@@ -64,6 +66,10 @@ class Status:
         self.engine_name = cfg.engine
         self.model_name = ""
         self.error: str | None = None
+        # 非序列化欄位：給 API handler 用的參考
+        self.engine = None
+        self.models: ModelManager | None = None
+        self.daemon = None      # 切換模型前要檢查它是不是 IDLE
 
     # -- 給 daemon 的回呼 --
     def on_state(self, state: str) -> None:
@@ -110,6 +116,7 @@ class Status:
             "engine": d["engine"],
             "model": d["model"],
             "error": d["error"],
+            "downloads": (self.models.active_downloads() if self.models else []),
         }
 
 
@@ -241,6 +248,15 @@ def make_handler(status: Status):
                 return self._send(200, f.read_bytes(), "text/html; charset=utf-8")
             if path == "/api/status":
                 return self._json(status.snapshot())
+            if path == "/api/models":
+                mgr = status.models
+                if mgr is None:
+                    return self._json({"models": [], "error": "模型管理未初始化"})
+                return self._json({
+                    "models": mgr.list_models(status.cfg.model_dir),
+                    "models_dir": str(models.MODELS_DIR),
+                    "release": models.RELEASE_TAG,
+                })
             if path == "/api/config":
                 cfg = status.cfg
                 devs = []
@@ -272,6 +288,12 @@ def make_handler(status: Status):
                     pass
 
         def _do_post(self):
+            if self.path == "/api/models/download":
+                return self._model_action("download")
+            if self.path == "/api/models/cancel":
+                return self._model_action("cancel")
+            if self.path == "/api/models/select":
+                return self._model_select()
             if self.path != "/api/config":
                 return self._json({"error": "unknown endpoint"}, 404)
             try:
@@ -287,6 +309,65 @@ def make_handler(status: Status):
             path = cfg.save()
             self._json({"ok": True, "saved": str(path),
                         "note": "部分設定需要重新啟動 VibeTalkie 才生效"})
+
+        # ---- 模型 ----
+        def _body(self) -> dict:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def _model_action(self, action: str):
+            mgr = status.models
+            if mgr is None:
+                return self._json({"ok": False, "message": "模型管理未初始化"}, 503)
+            try:
+                name = (self._body().get("name") or "").strip()
+            except Exception as exc:
+                return self._json({"ok": False, "message": f"bad json: {exc}"}, 400)
+            if not name:
+                return self._json({"ok": False, "message": "缺少 name"}, 400)
+            ok, msg = (mgr.start(name) if action == "download" else mgr.cancel(name))
+            # 被拒絕的請求不該回 200。實測踩過：路徑跳脫的名稱回 200 + 「名稱不合法」，
+            # 語意上等於「成功但訊息很奇怪」，讓呼叫端很難判斷。
+            return self._json({"ok": ok, "message": msg}, 200 if ok else 400)
+
+        def _model_select(self):
+            mgr = status.models
+            if mgr is None:
+                return self._json({"ok": False, "message": "模型管理未初始化"}, 503)
+            try:
+                name = (self._body().get("name") or "").strip()
+            except Exception as exc:
+                return self._json({"ok": False, "message": f"bad json: {exc}"}, 400)
+
+            if not models.is_ready(name):
+                return self._json({"ok": False,
+                                   "message": "這個模型還沒下載完成"}, 400)
+
+            # ⚠️ 錄音中換模型會讓正在跑的辨識拿到半個狀態
+            d = status.daemon
+            if d is not None and d.state != "IDLE":
+                return self._json({
+                    "ok": False,
+                    "message": f"目前狀態是 {d.state}，請等它回到待命再切換模型",
+                }, 409)
+
+            eng = status.engine
+            if eng is None:
+                return self._json({"ok": False, "message": "引擎未初始化"}, 503)
+            try:
+                eng.reload(models.model_dir(name))
+            except Exception as exc:
+                status.error = f"切換模型失敗：{exc}"
+                return self._json({"ok": False,
+                                   "message": f"載入失敗：{exc}"}, 500)
+
+            status.cfg.model_dir = name
+            status.cfg.save()
+            status.model_name = name
+            status.error = None
+            print(f"🔁 已切換模型：{name}")
+            return self._json({"ok": True, "message": f"已切換到 {name}",
+                               "model": name})
 
     return Handler
 
@@ -343,18 +424,39 @@ def main(argv: list[str] | None = None) -> int:
                            f"請確認麥克風已開機連線，或在設定介面重新選擇。")
 
     engine = build_engine(cfg.engine, threads=cfg.threads)
+    if not models.is_ready(cfg.model_dir):
+        # 設定檔指的模型不在 → 退回任何一個已安裝的，沒有就給明確指引
+        have = models.installed_models()
+        if have:
+            print(f"⚠️ 設定的模型「{cfg.model_dir}」不存在，改用「{have[0]}」")
+            cfg.model_dir = have[0]
+            cfg.save()
+            engine = build_engine(cfg.engine, threads=cfg.threads,
+                                  model_dir=models.model_dir(cfg.model_dir))
+        else:
+            print("❌ 尚未安裝任何語音模型。")
+            print("   啟動後在設定介面下載，或執行：")
+            print(f"   python tools/p1/fetch_model.py --get "
+                  f"{models.CATALOG[0].name}")
+            return 1
+    else:
+        engine = build_engine(cfg.engine, threads=cfg.threads,
+                              model_dir=models.model_dir(cfg.model_dir))
+
     ok, why = engine.is_available()
     if not ok:
         print(f"❌ 引擎不可用：{why}")
         return 1
-    print(f"辨識引擎：{engine.name}（本地）　繁體輸出："
-          f"{'是' if cfg.traditional and has_opencc() else '否'}")
+    print(f"辨識引擎：{engine.name}（本地）　模型：{engine.describe()}")
+    print(f"繁體輸出：{'是' if cfg.traditional and has_opencc() else '否'}")
     engine.warmup()
 
     status = Status(cfg)
-    status.model_name = getattr(engine, "model_dir", Path("")).name or "—"
+    status.model_name = cfg.model_dir
     status.vendor_warning = check_vendor_tool()
     status.mic_warning = mic_warning
+    status.engine = engine
+    status.models = ModelManager(on_change=lambda: None)
 
     daemon = PttDaemon(
         engine,
@@ -367,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         on_state=status.on_state,
         on_result=status.on_result,
     )
+    status.daemon = daemon
 
     port = pick_port(args.port or cfg.port)
     start_server(status, port)

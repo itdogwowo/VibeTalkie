@@ -61,6 +61,12 @@ function render(s) {
       : '<div class="empty">還沒有紀錄 —— 按住錄音鍵說一句話試試</div>';
   }
 
+  // 有下載在跑時才定期重抓模型清單（平常不打擾伺服器）
+  if (s.downloads && s.downloads.length && Date.now() - lastModelFetch > 1000) {
+    lastModelFetch = Date.now();
+    refreshModels();
+  }
+
   // 兩類警告共用同一個提示區塊
   const warns = [s.vendor_warning, s.mic_warning].filter(Boolean);
   if (warns.length) {
@@ -83,6 +89,118 @@ async function tick() {
     $("state").textContent = "連不上本機服務";
     $("statemeta").textContent = "請確認 VibeTalkie 還在執行";
     $("dot").className = "dot error";
+  }
+}
+
+// ---------------------------------------------------------------- 模型
+
+const MODEL_LABEL = {
+  ready: "已下載", absent: "未下載", queued: "排隊中",
+  downloading: "下載中", extracting: "解壓縮中",
+  error: "失敗", cancelled: "已取消",
+};
+
+let modelsCache = [];
+let lastModelFetch = 0;
+
+function fmtMb(mb) {
+  if (!mb) return "—";
+  return mb >= 1000 ? (mb / 1000).toFixed(2) + " GB" : Math.round(mb) + " MB";
+}
+
+function renderModels(list) {
+  modelsCache = list || [];
+  const box = $("models");
+  if (!modelsCache.length) {
+    box.innerHTML = '<div class="empty">沒有可用的模型清單</div>';
+    return;
+  }
+  box.innerHTML = modelsCache.map(m => {
+    const st = m.state;
+    const busy = st === "queued" || st === "downloading" || st === "extracting";
+    const dl = m.download || {};
+
+    let tags = "";
+    if (m.active) tags += '<span class="tag on">使用中</span>';
+    if (m.recommended && !m.active) tags += '<span class="tag rec">預設建議</span>';
+    tags += `<span class="tag ${st === "error" ? "bad" : ""}">${MODEL_LABEL[st] || st}</span>`;
+
+    let action = "";
+    if (st === "ready") {
+      action = m.active
+        ? '<span class="size">目前使用中</span>'
+        : `<button class="sm" data-select="${esc(m.name)}">切換使用</button>`;
+    } else if (busy) {
+      const extra = dl.speed_mbps ? `　${dl.speed_mbps} MB/s` : "";
+      action = `<span class="size">${dl.downloaded_mb || 0} / ${dl.total_mb || "?"} MB${extra}</span>
+                <button class="sm ghost" data-cancel="${esc(m.name)}">取消</button>`;
+    } else {
+      action = `<button class="sm" data-download="${esc(m.name)}">下載（${fmtMb(m.size_mb)}）</button>`;
+    }
+
+    let bar = "";
+    if (busy) {
+      const pct = st === "extracting" ? 100 : (dl.percent || 0);
+      bar = `<div class="pbar"><i style="width:${pct}%"></i></div>`;
+    }
+
+    const errLine = (st === "error" && dl.error)
+      ? `<div class="desc" style="color:var(--err)">⚠️ ${esc(dl.error)}</div>` : "";
+
+    return `<div class="model">
+      <div class="info">
+        <div class="name">${esc(m.title || m.name)} ${tags}</div>
+        <div class="desc">${esc(m.langs || "")}${m.langs ? "　·　" : ""}${fmtMb(m.size_mb)}</div>
+        <div class="desc">${esc(m.note || "")}</div>
+        ${errLine}
+        ${bar}
+      </div>
+      <div class="side">${action}</div>
+    </div>`;
+  }).join("");
+
+  box.querySelectorAll("[data-download]").forEach(b => {
+    b.onclick = () => modelAction("/api/models/download", b.dataset.download, b);
+  });
+  box.querySelectorAll("[data-cancel]").forEach(b => {
+    b.onclick = () => modelAction("/api/models/cancel", b.dataset.cancel, b, true);
+  });
+  box.querySelectorAll("[data-select]").forEach(b => {
+    b.onclick = () => modelAction("/api/models/select", b.dataset.select, b);
+  });
+}
+
+async function modelAction(path, name, btn, quiet) {
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    const r = await api(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!r.ok) {
+      alert(r.message || "操作失敗");
+    } else if (!quiet) {
+      $("saved").textContent = r.message || "已送出";
+      setTimeout(() => { $("saved").textContent = ""; }, 2500);
+    }
+  } catch (e) {
+    alert("操作失敗：" + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+    refreshModels();
+  }
+}
+
+async function refreshModels() {
+  try {
+    const r = await api("/api/models");
+    renderModels(r.models);
+  } catch (e) {
+    /* 靜默：狀態輪詢會再試 */
   }
 }
 
@@ -121,5 +239,6 @@ $("save").onclick = async () => {
 };
 
 loadConfig().catch(() => {});
+refreshModels();
 tick();
 setInterval(tick, 500);

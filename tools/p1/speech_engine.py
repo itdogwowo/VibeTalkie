@@ -118,7 +118,16 @@ class SpeechEngine(ABC):
 # ---------------------------------------------------------------- 本地引擎
 
 class SenseVoiceEngine(SpeechEngine):
-    """本地 sherpa-onnx + SenseVoice int8。"""
+    """本地 sherpa-onnx 引擎。
+
+    名字保留為 SenseVoiceEngine（既有程式與測試都引用它），但實際上
+    支援多種模型種類，由 `kind` 決定用哪個 sherpa-onnx 工廠：
+
+        sense_voice  有標點、多語言（預設）
+        paraformer   純中文，速度快，**不產生標點**
+
+    可以用 `kind="auto"` 讓它從模型目錄名自己判斷。
+    """
 
     name = "sherpa-onnx"
     is_local = True
@@ -126,21 +135,46 @@ class SenseVoiceEngine(SpeechEngine):
     DEFAULT_DIR = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 
     def __init__(self, model_dir: str | Path | None = None, threads: int = 2,
-                 use_itn: bool = True):
+                 use_itn: bool = True, kind: str = "auto"):
         self.model_dir = Path(model_dir) if model_dir else ROOT / "models" / self.DEFAULT_DIR
         self.threads = threads
         self.use_itn = use_itn
+        self.kind = kind
         self._rec = None
         self._load_ms = 0.0
+        self._resolved_kind: str | None = None
+        self._load_error: str | None = None
+
+    # -- 模型種類 --
+    def resolved_kind(self) -> str:
+        if self._resolved_kind:
+            return self._resolved_kind
+        k = self.kind
+        if k == "auto":
+            n = self.model_dir.name.lower()
+            if "paraformer" in n:
+                k = "paraformer"
+            elif "whisper" in n:
+                k = "whisper"
+            else:
+                k = "sense_voice"
+        self._resolved_kind = k
+        return k
+
+    def describe(self) -> str:
+        return f"{self.model_dir.name}（{self.resolved_kind()}）"
 
     def is_available(self) -> tuple[bool, str]:
         if not self.model_dir.is_dir():
             return False, (f"找不到模型目錄 {self.model_dir}。"
-                           f"先跑 python tools/p1/fetch_model.py --get {self.DEFAULT_DIR}")
+                           f"可在設定介面下載，或用 "
+                           f"python tools/p1/fetch_model.py --get {self.DEFAULT_DIR}")
         if not self._model_file():
             return False, f"{self.model_dir} 內沒有 model.onnx / model.int8.onnx"
         if not (self.model_dir / "tokens.txt").exists():
             return False, f"{self.model_dir} 內沒有 tokens.txt"
+        if self.resolved_kind() == "whisper":
+            return False, "Whisper 模型尚未支援（目前支援 sense_voice / paraformer）"
         try:
             import sherpa_onnx  # noqa: F401
         except ImportError:
@@ -155,23 +189,50 @@ class SenseVoiceEngine(SpeechEngine):
                 return p
         return None
 
-    def _ensure_loaded(self) -> None:
-        if self._rec is not None:
-            return
-        ok, why = self.is_available()
-        if not ok:
-            raise EngineUnavailable(why)
+    def _build(self):
         import sherpa_onnx  # type: ignore
-        t0 = time.perf_counter()
-        self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        common = dict(
             model=str(self._model_file()),
             tokens=str(self.model_dir / "tokens.txt"),
             num_threads=self.threads,
-            use_itn=self.use_itn,
-            language="auto",
             debug=False,
         )
+        if self.resolved_kind() == "paraformer":
+            # Paraformer 沒有 use_itn / language，特徵是 80 維 fbank
+            return sherpa_onnx.OfflineRecognizer.from_paraformer(
+                **common, sample_rate=16000, feature_dim=80,
+                decoding_method="greedy_search")
+        return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            **common, use_itn=self.use_itn, language="auto")
+
+    def _ensure_loaded(self) -> None:
+        if self._rec is not None:
+            return
+        if self._load_error:                       # 之前載入失敗過，不要一直重試
+            raise EngineUnavailable(self._load_error)
+        ok, why = self.is_available()
+        if not ok:
+            raise EngineUnavailable(why)
+        t0 = time.perf_counter()
+        try:
+            self._rec = self._build()
+        except Exception as exc:
+            self._load_error = f"載入模型失敗（{self.resolved_kind()}）：{exc}"
+            raise EngineUnavailable(self._load_error) from exc
         self._load_ms = (time.perf_counter() - t0) * 1000
+
+    # -- 切換模型 --
+    def reload(self, model_dir: str | Path) -> None:
+        """換成另一個模型並重新載入。
+
+        呼叫端必須確認**目前沒有在錄音**（狀態為 IDLE）——
+        推論中把 recognizer 換掉會讓正在進行的辨識拿到半個狀態。
+        """
+        self.model_dir = Path(model_dir)
+        self._rec = None
+        self._resolved_kind = None
+        self._load_error = None
+        self._ensure_loaded()          # 立刻載入，失敗會馬上拋錯而不是等到下一句話
 
     def warmup(self) -> None:
         self._ensure_loaded()
