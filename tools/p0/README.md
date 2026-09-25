@@ -26,7 +26,7 @@
 ```powershell
 pwsh -File tools/p0/enumerate_audio.ps1
 pwsh -File tools/p0/enumerate_audio.ps1 -Filter AI_VOICE
-python tools/p0/record_wav.py --list
+python app/core/record_wav.py --list
 ```
 
 **通過條件：** 看得到目標麥克風，且 `StateText = ACTIVE`。
@@ -37,13 +37,13 @@ python tools/p0/record_wav.py --list
 
 ```powershell
 # 1) 看驅動接受哪些取樣率（注意：接受 ≠ 真的有那個頻寬）
-python tools/p0/record_wav.py --probe --device 1
+python app/core/record_wav.py --probe --device 1
 
 # 2) 真正重要的：實際錄音 + 頻寬分析
-python tools/p0/record_wav.py --device 1 --seconds 6 --rate 16000
+python app/core/record_wav.py --device 1 --seconds 6 --rate 16000
 
 # 3) 重跑分析（不必重錄）
-python tools/p0/record_wav.py --analyze-wav artifacts/t2-dev1-16000hz.wav
+python app/core/record_wav.py --analyze-wav artifacts/t2-dev1-16000hz.wav
 ```
 
 錄音時請做兩件事：
@@ -73,7 +73,7 @@ python tools/p0/record_wav.py --analyze-wav artifacts/t2-dev1-16000hz.wav
 #### 判定器有單元測試
 
 ```powershell
-python tools/p0/test_bandwidth.py
+python tests/test_bandwidth.py
 ```
 
 涵蓋 4 個合成案例（純底噪／寬頻有高頻／4 kHz 以上切掉／極小聲）。
@@ -85,10 +85,10 @@ python tools/p0/test_bandwidth.py
 
 ```powershell
 # 先看裝置暴露了哪些 HID collection
-python tools/p0/keycode_logger.py --list-devices --filter 00001124
+python app/core/keycode_logger.py --list-devices --filter 00001124
 
 # 監聽 30 秒
-python tools/p0/keycode_logger.py --seconds 30
+python app/core/keycode_logger.py --seconds 30
 ```
 
 > 藍牙 HID 裝置的 interface path **不含裝置名稱**，只有 HID UUID，

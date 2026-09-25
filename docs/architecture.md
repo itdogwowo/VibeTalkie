@@ -152,7 +152,7 @@
 **抑制是可選的**（見 §3.2），所以 v1 用單通道即可。
 若日後要加抑制，才需要「hook 負責抑制 + Raw Input 負責辨識裝置」的時間關聯。
 
-**已實作於** [`tools/p1/ptt.py`](../tools/p1/ptt.py)：
+**已實作於** [`app/core/ptt.py`](../app/core/ptt.py)：
 預設 `--device-filter 00001124` + 要求 `E0`，
 所以按實體鍵盤的 Right Ctrl **不會**誤觸（`AppleKbd` 的 path 不含該 UUID）。
 

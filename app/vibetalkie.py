@@ -31,8 +31,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT / "tools" / "p1"))
-sys.path.insert(0, str(ROOT / "tools" / "p0"))
+sys.path.insert(0, str(HERE / "core"))          # 執行期模組
 
 from config import Config  # noqa: E402
 import config as config_module  # noqa: E402

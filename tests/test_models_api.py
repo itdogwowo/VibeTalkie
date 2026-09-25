@@ -10,7 +10,7 @@
 刻意**不**測真的下載：那會抓 78–234 MB，不該在測試裡做。
 下載路徑只測「拒絕」與「取消」的分支。
 
-執行：python app/test_models_api.py
+執行：python tests/test_models_api.py
 """
 
 from __future__ import annotations
@@ -26,8 +26,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT / "tools" / "p1"))
-sys.path.insert(0, str(ROOT / "tools" / "p0"))
+sys.path.insert(0, str(ROOT / "app"))
+sys.path.insert(0, str(ROOT / "app" / "core"))
+sys.path.insert(0, str(ROOT / "third_party"))
 
 import models  # noqa: E402
 from config import Config  # noqa: E402

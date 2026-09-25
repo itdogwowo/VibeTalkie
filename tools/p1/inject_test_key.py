@@ -31,7 +31,9 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_CORE = Path(__file__).resolve().parents[2] / "app" / "core"
+sys.path.insert(0, str(_CORE))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party"))
 
 from textin import KEYEVENTF_KEYUP, _key_event, _send  # noqa: E402
 

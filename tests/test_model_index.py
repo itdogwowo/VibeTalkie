@@ -7,7 +7,7 @@
       · 把能用的標成不可用 → 使用者找不到他要的模型
     名稱來自實際的 GitHub release 清單（499 個資產）。
 
-執行：python app/test_model_index.py
+執行：python tests/test_model_index.py
 """
 
 from __future__ import annotations
@@ -16,9 +16,11 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "tools" / "p0"))
-sys.path.insert(0, str(HERE.parent / "tools" / "p1"))
+sys.path.insert(0, str(ROOT / "app"))
+sys.path.insert(0, str(ROOT / "app" / "core"))
+sys.path.insert(0, str(ROOT / "third_party"))
 
 import model_index as mi  # noqa: E402
 

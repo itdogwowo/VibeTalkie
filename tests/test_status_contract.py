@@ -9,7 +9,7 @@
     這種「生產端與消費端欄位漂移」的 bug 用肉眼很難持續盯住，
     但用程式檢查很簡單：**app.js 讀了哪些 `s.<欄位>`，snapshot() 就必須提供。**
 
-執行：python app/test_status_contract.py
+執行：python tests/test_status_contract.py
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT / "tools" / "p1"))
-sys.path.insert(0, str(ROOT / "tools" / "p0"))
+sys.path.insert(0, str(ROOT / "app"))
+sys.path.insert(0, str(ROOT / "app" / "core"))
+sys.path.insert(0, str(ROOT / "third_party"))
 
 from config import Config  # noqa: E402
 from vibetalkie import Status  # noqa: E402
 
-UI_JS = HERE / "ui" / "app.js"
+UI_JS = ROOT / "app" / "ui" / "app.js"
 
 failures: list[str] = []
 

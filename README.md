@@ -28,11 +28,11 @@
 pwsh -File tools/p0/enumerate_audio.ps1
 
 # T2：錄 5 秒 16 kHz mono WAV
-python tools/p0/record_wav.py --list
-python tools/p0/record_wav.py --device 0 --seconds 5 --out artifacts/t2-mic.wav
+python app/core/record_wav.py --list
+python app/core/record_wav.py --device 0 --seconds 5 --out artifacts/t2-mic.wav
 
 # T3：攔截按鍵的真實鍵碼（Raw Input + Low-Level Hook）
-python tools/p0/keycode_logger.py --seconds 30
+python app/core/keycode_logger.py --seconds 30
 ```
 
 ## 隱私

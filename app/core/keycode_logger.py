@@ -15,13 +15,13 @@
 
 用法:
     # 先看系統有哪些 raw input 裝置（含 HID collection 的 usage page/usage）
-    python tools/p0/keycode_logger.py --list-devices
+    python app/core/keycode_logger.py --list-devices
 
     # 監聽 30 秒，請在裝置上按幾次按鈕
-    python tools/p0/keycode_logger.py --seconds 30
+    python app/core/keycode_logger.py --seconds 30
 
     # 輸出 JSONL 供後續分析（預設寫到 artifacts/，已 gitignore）
-    python tools/p0/keycode_logger.py --seconds 30 --out artifacts/t3-keycodes.jsonl
+    python app/core/keycode_logger.py --seconds 30 --out artifacts/t3-keycodes.jsonl
 
 僅使用標準函式庫（ctypes），不需要 pip install。
 只支援 Windows。

@@ -123,7 +123,7 @@ waveIn 裝置索引為 **`[1]`**。
 
 ### 3.1 裝置向 Raw Input 註冊的 collection
 
-用 `tools/p0/keycode_logger.py --list-devices --filter 00001124` 實測：
+用 `app/core/keycode_logger.py --list-devices --filter 00001124` 實測：
 
 | Collection | Raw Input 型別 | HID Usage | 判定 |
 |---|---|---|---|

@@ -9,10 +9,10 @@
     這件事必須在 P0 定案，不能拖到 P5 才發現。
 
 用法:
-    python tools/p0/record_wav.py --list                 # 列舉輸入裝置
-    python tools/p0/record_wav.py --probe --device 0     # 探測各取樣率是否被接受
-    python tools/p0/record_wav.py --device 0 --seconds 5 # 錄 5 秒 (預設 16k/mono/16bit)
-    python tools/p0/record_wav.py --device 0 --seconds 5 --rate 48000 --out artifacts/x.wav
+    python app/core/record_wav.py --list                 # 列舉輸入裝置
+    python app/core/record_wav.py --probe --device 0     # 探測各取樣率是否被接受
+    python app/core/record_wav.py --device 0 --seconds 5 # 錄 5 秒 (預設 16k/mono/16bit)
+    python app/core/record_wav.py --device 0 --seconds 5 --rate 48000 --out artifacts/x.wav
 
 僅使用標準函式庫（ctypes + winmm），不需要 pip install。
 只支援 Windows。輸出 WAV 位於 artifacts/（已 gitignore），請勿 commit 真實錄音。
@@ -367,7 +367,7 @@ def cmd_probe(device_id: int, channels: int, bits: int) -> int:
     print("   Windows 藍牙音訊堆疊會把 8 kHz 窄頻連結重採樣成你要求的任何取樣率，")
     print("   所以 48 kHz 也會被「接受」，但資料裡 4 kHz 以上全是空的。")
     print("   → 真正的頻寬只能靠實際錄音後的頻譜分析（本工具錄完會自動做）。")
-    print(f"   請接著跑：python tools/p0/record_wav.py --device {device_id} --seconds 6 --rate {best}")
+    print(f"   請接著跑：python app/core/record_wav.py --device {device_id} --seconds 6 --rate {best}")
     return 0
 
 

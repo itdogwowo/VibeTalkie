@@ -27,8 +27,9 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "p0"))
+_CORE = Path(__file__).resolve().parents[2] / "app" / "core"
+sys.path.insert(0, str(_CORE))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party"))
 
 from recorder import Capture  # noqa: E402
 from record_wav import setup_console  # noqa: E402

@@ -11,7 +11,7 @@
 兩條路徑餵給引擎的型別不一樣，而檔案路徑的測試完全蓋不到。
 所以這裡**兩條路徑都測**。
 
-執行：python tools/p1/test_speech_engine.py
+執行：python tests/test_speech_engine.py
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "app"))
+sys.path.insert(0, str(HERE.parent / "app" / "core"))
+sys.path.insert(0, str(HERE.parent / "third_party"))
 
 from speech_engine import (  # noqa: E402
     ApiEngine,
@@ -35,7 +37,7 @@ from speech_engine import (  # noqa: E402
     to_traditional,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]      # tests/ 的上一層才是專案根目錄
 MODEL_DIR = ROOT / "models" / SenseVoiceEngine.DEFAULT_DIR
 
 failures: list[str] = []

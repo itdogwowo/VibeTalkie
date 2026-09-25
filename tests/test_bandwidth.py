@@ -10,7 +10,7 @@
 這兩個錯誤都會讓「8 kHz 窄頻」被誤判成「16 kHz 寬頻」，
 也就是**把不合格的硬體判成合格**。所以值得有測試把它釘住。
 
-執行：python tools/p0/test_bandwidth.py
+執行：python tests/test_bandwidth.py
 （只用標準函式庫 + numpy，不需要 pytest。）
 """
 
@@ -20,7 +20,10 @@ import struct
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "app"))
+sys.path.insert(0, str(ROOT / "app" / "core"))
+sys.path.insert(0, str(ROOT / "third_party"))
 
 from record_wav import estimate_bandwidth, setup_console  # noqa: E402
 

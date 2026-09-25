@@ -136,12 +136,12 @@ Invoked with: ..., 16000, b'\xf0\xff\xef\xff...'
 錄音路徑給的是 PCM **bytes**，檔案路徑給的是 float list —— 只有檔案路徑做了轉換。
 **所有既有測試都走檔案路徑，完全蓋不到。**
 已改為兩條路徑共用 `pcm_to_samples()`，並補上
-[`test_speech_engine.py`](../../tools/p1/test_speech_engine.py)
+[`test_speech_engine.py`](../../tests/test_speech_engine.py)
 刻意同時測兩條路徑並斷言結果一致。
 
 ### ✅✅ 完整迴路成功：按住錄音鍵 → 說話 → 放開 → 文字出現
 
-`python tools/p1/ptt.py --debug`，實體裝置錄音鍵：
+`python app/core/ptt.py --debug`，實體裝置錄音鍵：
 
 ```
 · 接受 Ctrl DOWN flags=0x2 make=29 dev=BT-HID/Col01

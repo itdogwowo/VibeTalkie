@@ -22,8 +22,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parents[0] / "p0"))
+_CORE = Path(__file__).resolve().parents[2] / "app" / "core"
+sys.path.insert(0, str(_CORE))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party"))
 
 from speech_engine import (  # noqa: E402
     EngineNotConfigured,

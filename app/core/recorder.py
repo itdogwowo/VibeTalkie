@@ -9,7 +9,7 @@
       3. **即時顯示音量表** —— 使用者回報「系統裡看不到輸入音量」，
          所以在終端機自己畫一個，才知道有沒有收到聲音
 
-底層沿用 `tools/p0/record_wav.py` 已驗證過的 winmm waveIn 設定。
+底層沿用 `app/core/record_wav.py` 已驗證過的 winmm waveIn 設定。
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "p0"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # app/core
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party"))
 
 from record_wav import (  # noqa: E402
     CALLBACK_NULL,

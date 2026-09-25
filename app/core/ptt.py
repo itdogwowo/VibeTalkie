@@ -16,10 +16,10 @@
     IDLE ──按下錄音鍵──> RECORDING ──放開──> PROCESSING ──> INSERTING ──> IDLE
 
 用法:
-    python tools/p1/ptt.py --list-devices           # 確認要認哪個裝置
-    python tools/p1/ptt.py --device-filter 00001124 # 只認藍牙裝置的 Right Ctrl
-    python tools/p1/ptt.py --dry-run                # 只顯示事件，不注入文字
-    python tools/p1/ptt.py --traditional            # 輸出繁體
+    python app/core/ptt.py --list-devices           # 確認要認哪個裝置
+    python app/core/ptt.py --device-filter 00001124 # 只認藍牙裝置的 Right Ctrl
+    python app/core/ptt.py --dry-run                # 只顯示事件，不注入文字
+    python app/core/ptt.py --traditional            # 輸出繁體
 """
 
 from __future__ import annotations
@@ -32,9 +32,9 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent          # app/core
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parents[0] / "p0"))
+sys.path.insert(0, str(HERE.parents[2] / "third_party"))
 
 # 重用 P0 已經驗證過的 Raw Input 管線（結構定義、註冊、解析）
 from keycode_logger import (  # noqa: E402

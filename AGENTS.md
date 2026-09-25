@@ -63,29 +63,70 @@ VibeTalkie/
 ├─ VibeTalkie.desktop      # Linux 桌面項目
 ├─ launch.py               # 共用啟動器：檢查 Python/平台/相依/模型
 ├─ config.toml            # 使用者設定（gitignored，首次啟動自動產生）
-├─ docs/
-│  ├─ plan.md             # 總計畫書（含 §11.1 EDR 約束）
-│  ├─ hardware.md         # 實測硬體事實（不可重猜）
-│  ├─ architecture.md     # 系統架構
-│  ├─ adr/                # 技術決策紀錄
-│  └─ spike/              # python.md / rust.md / go.md
-├─ app/                   # 可用的殼層（P4 前的務實產物）
+│
+├─ app/                   # ★ 產品本體
 │  ├─ vibetalkie.py       # 進入點：PTT 常駐 + 本機 HTTP 伺服器
 │  ├─ config.py           # TOML 設定
 │  ├─ models.py           # 模型下載管理（背景執行、可取消）
 │  ├─ model_index.py      # 官方模型清單：抓取 → 分類 → 快取
+│  ├─ core/               # ★ 執行期模組（產品依賴，**不是工具**）
+│  │  ├─ speech_engine.py #   ASR 引擎（sherpa-onnx，多模型家族）
+│  │  ├─ ptt.py           #   PTT 常駐：Raw Input → 錄音 → 辨識 → 注入
+│  │  ├─ recorder.py      #   擷取封裝（自動停止、音量分析）
+│  │  ├─ record_wav.py    #   winmm waveIn 底層
+│  │  ├─ keycode_logger.py#   Raw Input 底層（ptt.py 從這裡匯入）
+│  │  └─ textin.py        #   文字注入：剪貼簿貼上／逐字輸入
 │  └─ ui/
 │     ├─ index.html       # 分頁結構（**不要放 inline JS**，見 §8.5）
 │     ├─ style.css        # 樣式
 │     └─ app.js           # UI 邏輯（改了重新整理即可，不用編譯）
-├─ tools/p0/              # P0 硬體驗證工具
-├─ tools/p1/              # P1：ASR 引擎、熱鍵、注入、診斷工具
-├─ third_party/           # 以 wheel 解開的套件（gitignored；本機 pip 是壞的）
+│
+├─ tests/                 # ★ 所有測試（見 §9）
+│  ├─ test_status_contract.py   test_model_index.py   test_models_api.py
+│  └─ test_speech_engine.py     test_bandwidth.py
+│
+├─ tools/                 # ★ 只有工具（**不被產品匯入**）
+│  ├─ p0/enumerate_audio.ps1            # T1 端點列舉
+│  └─ p1/                               # 診斷與一次性工具
+│     ├─ measure_bt_profile_switch.py   # 產出 hardware.md §2.2 的數據
+│     ├─ measure_audio_latency.py       # 產出 hardware.md §2.1 的數據
+│     ├─ inspect_recordings.py          # 錄音品質診斷
+│     ├─ fetch_wheels.py                # 以 wheel 解開套件（本機 pip 壞了）
+│     ├─ fetch_model.py                 # 命令列下載模型
+│     └─ （其餘為 P0/P1 期工具，見下方「待評估移除」）
+│
+├─ docs/                  # plan / hardware / architecture / adr / spike
+├─ third_party/           # wheel 解開的套件（gitignored；本機 pip 是壞的）
 ├─ models/                # ASR 模型（gitignored）
-├─ artifacts/             # 實測產出物（gitignored）
+├─ artifacts/             # 實測產出物、錄音（gitignored）
 ├─ src-tauri/             # 只有 P4 決定選 Rust 才建立
 └─ src/                   # 同上
 ```
+
+### ⚠️ 為什麼有 `app/core/`（不要把它的內容當成 `tools/`）
+
+原本執行期模組住在 `tools/p1/` 與 `tools/p0/`，結果 **42% 的產品程式碼
+（2862 行）住在一個叫「工具」的資料夾裡** —— 任何人打開 repo 都會誤判，
+連 AI 都得先查 import 關係才敢動。
+
+已重組，判準只有一條：
+
+> **會被 `app/` 匯入的 → `app/core/`；不會被匯入的 → `tools/`。**
+> `tools/` 底下任何檔案被 `app/` 匯入，就是放錯位置了。
+
+**待評估移除**（P0/P1 期產物，產品不使用，使用者已表示不需要）：
+
+| 檔案 | 行數 | 狀態 |
+|---|---|---|
+| `tools/p1/asr_bench.py` + `record_testset.py` + `testset_zh.txt` | ~550 | 20 句基準測試；使用者決定不做 |
+| `tools/p1/transcribe.py` | 191 | 最小 CLI，已被 `app/` 取代 |
+| `tools/p1/inject_test_key.py` | 71 | 合成按鍵；已記錄無法驗證完整迴路 |
+
+> 📌 **已知設計瑕疵（尚未處理）：** `app/core/keycode_logger.py` 與
+> `app/core/record_wav.py` 同時是「執行期底層」與「獨立 CLI 工具」。
+> 理想上應拆成 `app/core/rawinput.py`（純函式庫）+ `tools/keycode_logger.py`
+> （薄 CLI），但那是較大的重構，暫時先放 `app/core/` 並保留 CLI。
+
 
 ---
 
@@ -161,7 +202,7 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 **規則 2：必須能分辨「這顆鍵是不是目標裝置送的」。**
 使用者的實體鍵盤也有 Right Ctrl。**不區分裝置的話，按實體鍵盤的 Ctrl 也會觸發錄音。**
 
-實作方式（**已在 Python 驗證，`tools/p1/ptt.py`**）：
+實作方式（**已在 Python 驗證，`app/core/ptt.py`**）：
 
 | 需求 | 機制 | 需要低階 hook 嗎 |
 |---|---|---|
@@ -301,12 +342,12 @@ for ($i=0; $i -lt $b.Length; $i++) {
 ### 改完一定要跑的測試
 
 ```powershell
-python app/test_status_contract.py       # UI ↔ /api/status 欄位契約
-python app/test_model_index.py           # 模型分類器（可用/不可用判斷）
-python app/test_model_index.py --live    # 對真實 499 筆跑統計（需連網）
-python app/test_models_api.py            # 模型下載／切換 API
-python tools/p1/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
-python tools/p0/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）
+python tests/test_status_contract.py       # UI ↔ /api/status 欄位契約
+python tests/test_model_index.py           # 模型分類器（可用/不可用判斷）
+python tests/test_model_index.py --live    # 對真實 499 筆跑統計（需連網）
+python tests/test_models_api.py            # 模型下載／切換 API
+python tests/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
+python tests/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）
 ```
 
 `test_status_contract.py` 會去讀 `app/ui/app.js`，檢查 UI 引用到的每個
