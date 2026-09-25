@@ -88,21 +88,23 @@ class Status:
                 "history": list(self.history),
                 "latency": self.latency,
                 "vendor_warning": self.vendor_warning,
+                "mic_warning": self.mic_warning,
                 "engine": self.engine_name,
                 "model": self.model_name,
                 "error": self.error,
             }
         # UI 的欄位名稱
         s = d["stats"]
+        lat = d["latency"] or {}
         return {
             "state": d["state"],
             "level": d["level"],
             "presses": s["presses"], "inserted": s["inserted"],
             "empty": s["empty"], "failed": s["failed"],
             "history": d["history"],
-            "latency_ms": (d["latency"] or {}).get("total_ms"),
-            "asr_ms": (d["latency"] or {}).get("asr_ms"),
-            "paste_ms": (d["latency"] or {}).get("paste_ms"),
+            "latency_ms": lat.get("total_ms"),
+            "asr_ms": lat.get("asr_ms"),
+            "paste_ms": lat.get("paste_ms"),
             "vendor_warning": d["vendor_warning"],
             "mic_warning": d["mic_warning"],
             "engine": d["engine"],
@@ -188,8 +190,22 @@ def pick_port(preferred: int) -> int:
 # ---------------------------------------------------------------- HTTP
 
 def make_handler(status: Status):
+    # 同一種錯誤只印一次。UI 每 500ms 輪詢一次，若 handler 每次都在同一個
+    # 欄位錯誤上爆掉，就會變成每秒兩次的 traceback 風暴，把真正有用的訊息淹掉。
+    # （實際發生過：snapshot() 少了一個 key，log 被洗掉。）
+    reported: set[str] = set()
+    reported_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "VibeTalkie"
+
+        def _report_once(self, exc: BaseException) -> None:
+            sig = f"{type(exc).__name__}: {exc}"
+            with reported_lock:
+                if sig in reported:
+                    return
+                reported.add(sig)
+            print(f"\n⚠️ UI API 錯誤（同一種只顯示一次）：{sig}", file=sys.stderr)
 
         def log_message(self, fmt, *args):        # 安靜一點
             pass
@@ -207,6 +223,16 @@ def make_handler(status: Status):
                        "application/json; charset=utf-8")
 
         def do_GET(self):
+            try:
+                self._do_get()
+            except Exception as exc:
+                self._report_once(exc)
+                try:
+                    self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+                except Exception:
+                    pass
+
+        def _do_get(self):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 f = UI_DIR / "index.html"
@@ -236,6 +262,16 @@ def make_handler(status: Status):
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            try:
+                self._do_post()
+            except Exception as exc:
+                self._report_once(exc)
+                try:
+                    self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+                except Exception:
+                    pass
+
+        def _do_post(self):
             if self.path != "/api/config":
                 return self._json({"error": "unknown endpoint"}, 404)
             try:

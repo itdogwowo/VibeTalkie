@@ -295,11 +295,36 @@ for ($i=0; $i -lt $b.Length; $i++) {
 
 ## 9. 工程習慣
 
+### 改完一定要跑的測試
+
+```powershell
+python app/test_status_contract.py       # UI ↔ /api/status 欄位契約
+python tools/p1/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
+python tools/p0/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）
+```
+
+`test_status_contract.py` 會去讀 `app/ui/app.js`，檢查 UI 引用到的每個
+`s.<欄位>` 都存在於 `snapshot()` 的回傳裡。
+
+> **為什麼要有這個測試：** 實際踩過 —— 我在 `snapshot()` 的回傳加了
+> `mic_warning`，卻忘了在來源 dict 裡也加 → `KeyError`，
+> 而 UI **每 500ms 輪詢一次**，變成每秒兩次的 traceback 風暴。
+> 這種「生產端/消費端欄位漂移」用眼睛盯不住，用程式檢查很簡單。
+
+**加欄位的流程：** 先改 `snapshot()`，再改 `app.js`，然後**跑一次契約測試**。
+
+### 其他
+
 - **小步 commit**，一次一件事。commit message 用 `type: 描述`（`feat` / `fix` / `docs` / `chore` / `spike`）。
 - **TDD**：先寫失敗的測試，再寫最小實作。音訊／ASR 模組以「餵 WAV → 斷言文字」為測試形式。
 - **YAGNI**：不為想像中的需求加抽象。雲端 ASR、多引擎只在 `SpeechEngine` 介面留位置，v1 不實作。
 - **不要 push。** push 前必須逐次取得使用者同意；`force push` 要另外同意。
+- ⚠️ **不要用 `git checkout -- <file>` 丟掉還沒 commit 的工作。**
+  實際踩過：為了驗證測試有沒有牙齒而暫時改壞一個檔案，然後用
+  `git checkout --` 還原 —— 結果把**同一個檔案裡其他還沒 commit 的修正一起洗掉**。
+  要驗證「測試抓不抓得到」請**複製到暫存檔**再改，或先 commit。
 - 註解與文件用**繁體中文**；程式識別字用英文。
+
 
 ---
 
