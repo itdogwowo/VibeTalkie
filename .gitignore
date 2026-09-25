@@ -1,0 +1,39 @@
+# ---- 模型權重（不入 git；需要時用 git-lfs 或 release asset）----
+models/
+*.onnx
+*.bin
+*.gguf
+*.pt
+*.nemo
+
+# ---- P0/P1 實測產出物（含真實錄音與裝置指紋，絕不進版控）----
+artifacts/
+*.wav
+*.jsonl
+tools/**/out/
+docs/hardware-local.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- Rust / Tauri ----
+target/
+src-tauri/target/
+node_modules/
+dist/
+
+# ---- 本機環境與機密 ----
+.env
+.env.*
+*.local
+.privacy-denylist.txt
+
+# ---- 編輯器 / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
