@@ -108,6 +108,21 @@ def vk_name(vk: int) -> str:
     return VK_NAMES.get(vk, f"VK_0x{vk:02X}")
 
 
+def device_label(name: str | None) -> str:
+    """把冗長的 interface path 縮成可讀標籤。Col01 / Col02 一定要看得出來，
+    因為那正是「按鈕在哪個 collection」的答案。"""
+    if not name:
+        return "-"
+    if "00001124" in name:  # 藍牙 HID
+        col = "?"
+        if "&Col" in name:
+            col = name.split("&Col")[1][:2].rstrip("#")
+        return f"BT-HID/Col{col}"
+    if "VID_05AC" in name:
+        return "AppleKbd"
+    return name.split("#")[0][-20:]
+
+
 def setup_console() -> None:
     """Windows 主控台預設不是 UTF-8，中文輸出會變亂碼。強制切到 UTF-8。"""
     try:
@@ -273,7 +288,10 @@ def device_info(hdevice) -> dict:
     out: dict = {"raw_type": int(info.dwType)}
     if info.dwType == RIM_TYPEKEYBOARD:
         out.update(kind="keyboard", keyboard_mode=int(info.u.keyboard.dwKeyboardMode),
-                   keys_total=int(info.u.keyboard.dwNumberOfKeysTotal))
+                   keys_total=int(info.u.keyboard.dwNumberOfKeysTotal),
+                   # 鍵盤 top-level collection 固定是 Generic Desktop / Keyboard。
+                   # 明確寫出來，log 才看得懂事件來自哪一層。
+                   usage_page=0x01, usage=0x06)
     elif info.dwType == RIM_TYPEMOUSE:
         out.update(kind="mouse", buttons=int(info.u.mouse.dwNumberOfButtons))
     elif info.dwType == RIM_TYPEHID:
@@ -367,15 +385,15 @@ class KeycodeLogger:
                     f"scan={rec.get('scan')} flags=0x{rec.get('flags', 0):X} "
                     f"injected={rec.get('injected')}")
         if src == "rawkb":
-            return (f"[rawkb] {rec.get('message_name')} vk={rec.get('vk')} "
-                    f"({rec.get('vk_name')}) make={rec.get('make_code')} "
-                    f"flags=0x{rec.get('flags', 0):X} | dev_usage_page={rec.get('dev_usage_page')} "
-                    f"dev_usage={rec.get('dev_usage')}")
+            state = "DOWN" if rec.get("is_down") else "UP  "
+            return (f"[rawkb] {state} {rec.get('dev_label', '?'):<12} "
+                    f"vk={rec.get('vk')} ({rec.get('vk_name')}) make={rec.get('make_code')} "
+                    f"page={rec.get('dev_usage_page')} usage={rec.get('dev_usage')}")
         if src == "rawhid":
-            return (f"[rawhid] usage_page={rec.get('dev_usage_page')} usage={rec.get('dev_usage')} "
-                    f"vid={rec.get('vid')} pid={rec.get('pid')} "
+            return (f"[rawhid] {rec.get('dev_label', '?'):<12} page={rec.get('dev_usage_page')} "
+                    f"usage={rec.get('dev_usage')} vid={rec.get('vid')} pid={rec.get('pid')} "
                     f"report_id={rec.get('report_id')} len={rec.get('size_hid')} "
-                    f"count={rec.get('count')} data={rec.get('data_hex')}")
+                    f"data={rec.get('data_hex')}")
         return f"[{src}] {json.dumps(rec, ensure_ascii=False)}"
 
     # -- 訊息處理
@@ -413,10 +431,13 @@ class KeycodeLogger:
             msg_name = {WM_KEYDOWN: "WM_KEYDOWN", WM_KEYUP: "WM_KEYUP",
                         WM_SYSKEYDOWN: "WM_SYSKEYDOWN", WM_SYSKEYUP: "WM_SYSKEYUP"}.get(
                 kb.Message, f"0x{kb.Message:04X}")
+            down = kb.Message in (WM_KEYDOWN, WM_SYSKEYDOWN)
             self.emit("rawkb",
                       vk=int(kb.VKey), vk_name=vk_name(int(kb.VKey)),
                       make_code=int(kb.MakeCode), flags=int(kb.Flags),
                       message=int(kb.Message), message_name=msg_name,
+                      is_down=down,
+                      dev_label=device_label(info.get("name")),
                       dev_name=info.get("name", ""),
                       dev_usage_page=info.get("usage_page"),
                       dev_usage=info.get("usage"))
@@ -432,6 +453,7 @@ class KeycodeLogger:
                       dev_usage_page=info.get("usage_page"), dev_usage=info.get("usage"),
                       size_hid=int(hid.dwSizeHid), count=int(hid.dwCount),
                       report_id=report_id, data_hex=raw.hex(" "),
+                      dev_label=device_label(info.get("name")),
                       dev_name=info.get("name", ""))
 
     def _ll_hook(self, ncode, wparam, lparam):
@@ -527,6 +549,138 @@ class KeycodeLogger:
                 for rec in self.records:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             print(f"\n已寫出 {len(self.records)} 筆事件 → {self.out_path}")
+        summarize(self.records)
+
+
+def _is_down(rec: dict) -> bool:
+    """判斷是否為按下。
+
+    新版紀錄有 is_down 欄位；舊版只有 message_name，所以要能回退，
+    否則分析舊檔會把所有事件都算成「放開」。
+    """
+    if "is_down" in rec:
+        return bool(rec["is_down"])
+    return "KEYDOWN" in (rec.get("message_name") or "")
+
+
+def _usage_of(rec: dict) -> tuple[int | None, int | None]:
+    """取得事件所屬 collection 的 usage。
+
+    重要推論：**rawkb 事件必然來自鍵盤 top-level collection**，
+    因為我們只註冊了 Generic Desktop/Keyboard 與 Keypad 進 Raw Input 的鍵盤通道。
+    所以舊檔缺 usage 欄位時可以直接補上，不需要重錄。
+    """
+    page, usage = rec.get("dev_usage_page"), rec.get("dev_usage")
+    if page is None and rec["source"] == "rawkb":
+        return 0x01, 0x06
+    return page, usage
+
+
+def summarize(records: list[dict], replay: bool = False) -> None:
+    """折疊自動重複後，回答「按鈕到底送了什麼」。
+
+    為什麼要折疊？按住不放時 Windows 會以約 30 ms 間隔連續送 WM_KEYDOWN
+    （自動重複）。若直接數事件數，按一次會被算成十幾次，看不出真相。
+    折疊規則：同一裝置、同一鍵碼，在收到對應的 UP 之前的連續 DOWN 只算「一次按下」。
+
+    ⚠️ 已知未解現象（2026-09 實測）：某次擷取中 Low-Level Hook 看到 18 次
+    VK_RCONTROL 按下並帶有明顯自動重複節奏（首次按下後 ~500 ms 起、每 ~30 ms 一次），
+    但 Raw Input 只看到 2 次對應的「放開」、完全沒有「按下」。
+    此差異**尚未釐清**，不要當成已知行為使用。若再遇到，請保留原始 JSONL 供比對，
+    並確認是否與裝置重連／修飾鍵狀態有關。
+    """
+    real = [r for r in records if r["source"] in ("rawkb", "rawhid")]
+    if not real:
+        print("\n⚠️ 完全沒有 Raw Input 事件 —— 只有 Low-Level Hook 的紀錄。")
+        print("   這代表沒有任何 HID 裝置符合我們註冊的 usage（keyboard / consumer /")
+        print("   system control）。請改跑 --list-devices 檢查裝置是否還在。")
+        return
+
+    if any("is_down" not in r for r in real if r["source"] == "rawkb"):
+        print("\nℹ️ 此檔為舊版格式（無 is_down 欄位），已改用 message_name 判讀按下／放開。")
+
+    presses: dict[tuple, dict] = {}
+    pending: set = set()
+
+    for r in real:
+        dev = r.get("dev_label") or device_label(r.get("dev_name"))
+        page, usage = _usage_of(r)
+        if r["source"] == "rawhid":
+            key = (dev, "HID", r.get("report_id"), r.get("data_hex"))
+            label = f"HID report {r.get('data_hex')}"
+        else:
+            key = (dev, r.get("vk"))
+            label = f"{r.get('vk_name')} (vk=0x{(r.get('vk') or 0):02X})"
+        entry = presses.setdefault(key, {"dev": dev, "label": label, "downs": 0,
+                                        "ups": 0, "autorepeat": 0, "src": r["source"],
+                                        "usage_page": page, "usage": usage})
+        if r["source"] == "rawhid":
+            entry["downs"] += 1
+            continue
+        if _is_down(r):
+            entry["downs"] += 1
+            if key in pending:
+                entry["autorepeat"] += 1
+            pending.add(key)
+        else:
+            entry["ups"] += 1
+            pending.discard(key)
+
+    print("\n" + "=" * 78)
+    print("摘要（已折疊自動重複）")
+    print("=" * 78)
+    print(f"{'裝置':<14} {'鍵碼':<22} {'按下':>4} {'放開':>4} {'自動重複':>8} {'來源':<7}")
+    print("-" * 78)
+    for e in sorted(presses.values(), key=lambda x: -x["downs"]):
+        print(f"{e['dev']:<14} {e['label']:<22} {e['downs']:>4} {e['ups']:>4} "
+              f"{e['autorepeat']:>8} {e['src']:<7}")
+
+    bt = [e for e in presses.values() if e["dev"].startswith("BT-HID")]
+    print()
+    if not bt:
+        print("→ 這次完全沒有收到藍牙 HID 裝置的事件。")
+        print("  若你確實按了按鈕，代表按鈕走的不是 HID（可能是 SPP／廠商通道），")
+        print("  或裝置目前是關機／未連線狀態。")
+        return
+
+    print("藍牙 HID 裝置送出的鍵：")
+    for e in bt:
+        tag = ("鍵盤 collection" if (e["usage_page"] == 0x01 and e["usage"] == 0x06)
+               else f"page={e['usage_page']} usage={e['usage']}")
+        print(f"  • {e['label']}  —  {tag}，按下 {e['downs']} 次 / 放開 {e['ups']} 次")
+    print()
+    print("判讀：")
+    if any(e["usage_page"] == 0x0C for e in bt):
+        print("  ⚠️ 有事件來自 Consumer Control → 一般全域熱鍵函式庫可能失效，需用 Raw Input。")
+    if any(e["src"] == "rawhid" for e in bt):
+        print("  ⚠️ 有事件只以原始 HID 位元組出現 → 標準鍵盤 API 看不到，必須走 HID API。")
+    if all(e["usage_page"] == 0x01 for e in bt) and all(e["src"] == "rawkb" for e in bt):
+        print("  ✅ 按鈕是標準鍵盤鍵 → 三棧的全域熱鍵都能用。")
+    mods = [e for e in bt if (e["usage_page"] == 0x01 and e["usage"] == 0x06
+                              and e["label"].startswith("VK_")
+                              and any(m in e["label"] for m in
+                                      ("SHIFT", "CONTROL", "MENU", "WIN")))]
+    if mods:
+        print("  ⚠️ 按鈕是『修飾鍵』（Ctrl / Shift / Alt / Win）：")
+        print("     - global-hotkey 這類函式庫通常**不支援單一修飾鍵**當熱鍵。")
+        print("     - 按住期間會改寫其他按鍵的語意，且與 Ctrl+V 注入直接衝突。")
+        print("     - 熱鍵層需要用 Low-Level Hook / Raw Input 自行處理，三棧都一樣。")
+        print("     - 建議：v1 先綁一個非修飾鍵做驗證，把修飾鍵當已知限制。")
+    if not replay:
+        print()
+        print("提醒：請確認上表中『按下次數 == 你實際按的次數』。")
+        print("      若你按了 3 次卻看到更多／更少，代表有其他按鍵混進來了。")
+
+
+def cmd_analyze(path: Path) -> int:
+    if not path.exists():
+        print(f"找不到檔案：{path}", file=sys.stderr)
+        return 1
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+               if line.strip()]
+    print(f"讀入 {len(records)} 筆事件：{path}")
+    summarize(records, replay=True)
+    return 0
 
 
 # ---------------------------------------------------------------- CLI
@@ -579,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
         description="P0/T3：記錄藍牙裝置按鈕的真實鍵碼（Raw Input + Low-Level Hook）")
     parser.add_argument("--list-devices", action="store_true",
                         help="列出 raw input 裝置（含 HID collection 的 usage）後結束")
+    parser.add_argument("--analyze", default=None, metavar="JSONL",
+                        help="不監聽，直接分析既有的 JSONL 紀錄並印出摘要")
     parser.add_argument("--filter", default=None,
                         help="在 --list-devices 時標出符合此關鍵字的裝置（例：AI_VOICE）")
     parser.add_argument("--seconds", type=float, default=30.0,
@@ -593,6 +749,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_devices:
         return cmd_list_devices(args.filter)
+    if args.analyze:
+        return cmd_analyze(Path(args.analyze))
 
     out = None if args.no_out else Path(args.out)
     logger = KeycodeLogger(out_path=out, quiet_hook=not args.show_injected)

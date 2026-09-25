@@ -66,25 +66,45 @@ python tools/p0/record_wav.py --device 1 --seconds 6 --rate 16000
 # 先看裝置暴露了哪些 HID collection
 python tools/p0/keycode_logger.py --list-devices --filter 00001124
 
-# 監聽 30 秒，期間在裝置上按按鈕 3 次（每次按一下就放開）
+# 監聽 30 秒
 python tools/p0/keycode_logger.py --seconds 30
 ```
 
 > 藍牙 HID 裝置的 interface path **不含裝置名稱**，只有 HID UUID，
 > 所以用品牌名過濾抓不到 → 請用 `--filter 00001124`。
 
+#### 嚴格協定（第一次擷取失敗的原因）
+
+第一次擷取時有其他打字混入，導致無法判斷哪個事件是「按鈕」。
+請照這個協定做：
+
+1. 執行上面的監聽指令，**讓游標停在終端機視窗**。
+2. **手離開鍵盤，不要打任何字。**
+3. 只按裝置按鈕 **3 次**：每次**按住約 1 秒**再放開，間隔約 2 秒。
+4. 等它自己結束（或按 Ctrl+C 提前結束 —— 但這會多一組 Ctrl 事件，可忽略）。
+
+結束後工具會自動印出**摘要（已折疊自動重複）**。
+判準：**你按 3 次，摘要就該顯示 3 次按下**。是 3 就定案；不是 3 就代表協定被污染。
+
+要重新分析舊紀錄（不必重錄）：
+
+```powershell
+python tools/p0/keycode_logger.py --analyze artifacts/t3-keycodes.jsonl
+```
+
 **怎麼讀結果：**
 
 | 看到的東西 | 意義 | 熱鍵層要用的 API |
 |---|---|---|
-| `[rawkb]` 事件，`dev_usage=6` | 按鈕是**標準鍵盤鍵** | 一般全域熱鍵即可（`global-hotkey` / `pynput`） |
-| `[rawkb]` 事件，`dev_usage=1` 且 `page=12` | 按鈕在 **Consumer Control** | 一般熱鍵**可能失效** → 需 Raw Input |
-| 只有 `[rawhid]` 事件 | 按鈕在**廠商自訂 collection** | 標準鍵盤 API **完全看不到** → 只能用 HID API |
+| `[rawkb]` 事件，`page=1 usage=6` | 按鈕是**標準鍵盤鍵** | 一般全域熱鍵即可（`global-hotkey` / `pynput`） |
+| `[rawhid]` 事件，`page=12 usage=1` | 按鈕在 **Consumer Control** | 一般熱鍵**可能失效** → 需 Raw Input |
+| 只有 `[rawhid]` 事件，其他 page | 按鈕在**廠商自訂 collection** | 標準鍵盤 API **完全看不到** → 只能用 HID API |
 | 完全沒有事件 | 按鈕不是 HID，或走 SPP/廠商通道 | 需重新設計架構（見 hardware.md 的架構分支） |
+| 鍵碼是 `VK_CONTROL` / `VK_SHIFT` / `VK_MENU` | 按鈕是**修飾鍵** | 三棧的現成熱鍵函式庫**都不支援**，且與 `Ctrl+V` 注入衝突 |
 
-**記錄重點（回填 `hardware.md`）：**
-按下與放開是否都收得到？鍵碼是 `VK_*` 還是 consumer usage？
-event 是 `rawkb` 還是 `rawhid`？
+**記錄重點（回填 `hardware.md`）：** 按下與放開是否都收得到？
+按鈕在哪個 collection？鍵碼是什麼？按下次數是否等於實際次數？
+
 
 ### T4 — 裝置會不會自行打字（手動）
 
