@@ -60,6 +60,7 @@ class Status:
         self.history: deque[dict] = deque(maxlen=30)
         self.latency: dict | None = None
         self.vendor_warning: str | None = None
+        self.mic_warning: str | None = None
         self.engine_name = cfg.engine
         self.model_name = ""
         self.error: str | None = None
@@ -103,6 +104,7 @@ class Status:
             "asr_ms": (d["latency"] or {}).get("asr_ms"),
             "paste_ms": (d["latency"] or {}).get("paste_ms"),
             "vendor_warning": d["vendor_warning"],
+            "mic_warning": d["mic_warning"],
             "engine": d["engine"],
             "model": d["model"],
             "error": d["error"],
@@ -289,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 用名稱解析出「現在」的索引（index 會隨重連改變，見 resolve_device）
     dev_index, dev_name, _ = resolve_device(cfg)
+    mic_warning = None
     if dev_name:
         print(f"使用麥克風：[{dev_index}] {dev_name}")
         if cfg.mic_name != dev_name:          # 第一次或名稱被截斷 → 記下來
@@ -297,6 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"使用麥克風：index {dev_index}（尚未綁定名稱，"
               f"請在設定介面選一次以固定下來）")
+        if cfg.mic_name:
+            # 設定檔綁的麥克風不見了（藍牙關機／斷線／換裝置）
+            mic_warning = (f"設定的麥克風「{cfg.mic_name}」目前不在裝置清單中，"
+                           f"已暫時改用 index {dev_index}。"
+                           f"請確認麥克風已開機連線，或在設定介面重新選擇。")
 
     engine = build_engine(cfg.engine, threads=cfg.threads)
     ok, why = engine.is_available()
@@ -310,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     status = Status(cfg)
     status.model_name = getattr(engine, "model_dir", Path("")).name or "—"
     status.vendor_warning = check_vendor_tool()
+    status.mic_warning = mic_warning
 
     daemon = PttDaemon(
         engine,

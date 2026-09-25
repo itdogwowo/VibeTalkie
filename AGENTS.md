@@ -58,7 +58,10 @@
 VibeTalkie/
 ├─ AGENTS.md              # 本檔
 ├─ README.md
-├─ 啟動 VibeTalkie.cmd    # 一鍵啟動（保留可見主控台，見 §8.5）
+├─ VibeTalkie.cmd         # Windows 雙擊入口（**純 ASCII + CRLF**，見 §8.6）
+├─ 啟動 VibeTalkie.command # macOS 雙擊入口
+├─ VibeTalkie.desktop      # Linux 桌面項目
+├─ launch.py               # 共用啟動器：檢查 Python/平台/相依/模型
 ├─ config.toml            # 使用者設定（gitignored，首次啟動自動產生）
 ├─ docs/
 │  ├─ plan.md             # 總計畫書（含 §11.1 EDR 約束）
@@ -69,7 +72,9 @@ VibeTalkie/
 ├─ app/                   # 可用的殼層（P4 前的務實產物）
 │  ├─ vibetalkie.py       # 進入點：PTT 常駐 + 本機 HTTP 伺服器
 │  ├─ config.py           # TOML 設定
-│  └─ ui/index.html       # **純靜態 UI，改了重新整理即可，不用編譯**
+│  └─ ui/
+│     ├─ index.html       # 只放結構與樣式（**不要放 inline JS**，見 §8.5）
+│     └─ app.js           # UI 邏輯（改了重新整理即可，不用編譯）
 ├─ tools/p0/              # P0 硬體驗證工具
 ├─ tools/p1/              # P1：ASR 引擎、熱鍵、注入、診斷工具
 ├─ third_party/           # 以 wheel 解開的套件（gitignored；本機 pip 是壞的）
@@ -194,31 +199,97 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 
 **這個工具的核心行為，在 EDR 眼裡就是鍵盤側錄程式：**
 
-| 我們做的事 | EDR 的判讀 |
+| 我們做的事 | EDR 可能怎麼看 |
 |---|---|
-| `RIDEV_INPUTSINK` 攔截全系統鍵盤 | 視窗未聚焦也收按鍵 → **側錄 API** |
+| `RIDEV_INPUTSINK` 攔截全系統鍵盤 | 視窗未聚焦也收按鍵 |
 | `SendInput` 注入按鍵 | 模擬輸入 |
-| 讀取剪貼簿（備份） | 剪貼簿側錄 |
-| `pythonw` + `start` 背景啟動 | 隱藏行程、脫離父行程 |
+| 讀取剪貼簿（備份） | 剪貼簿存取 |
 
-**已實際被 Cortex XDR 中斷過一次**（無殘留行程、日誌停在暖機階段）。
-完整分析見 `docs/plan.md` §11.1。
+### 實際發生的事（Cortex XDR 警報原文摘要）
+
+```
+Component       : Behavioral Threat Protection
+Cortex XDR code : C0400067
+Rule name       : amsi_malicious_js_activity     ← 關鍵
+Source process  : WindowsTerminal.exe            ← 是終端機，不是 VibeTalkie
+Quarantined     : False                          ← 沒有任何檔案被隔離
+```
+
+**這是 JavaScript 相關的 AMSI 規則，不是上面那張表的行為判定。**
+AMSI 是 PowerShell / JScript 這類**腳本引擎**送交掃描的介面。
+最可能的觸發點：**用 PowerShell 的 `Invoke-WebRequest` 去抓
+`http://127.0.0.1:8756/`** —— 一個非瀏覽器行程下載內含 inline JS 的網頁。
+
+> ⚠️ **更正紀錄：** 我先前根據上面那張表推論「被當成鍵盤側錄程式」。
+> **那個結論是錯的** —— 規則名稱、來源行程、未隔離三項證據都不支持它。
+> 不要沿用那個說法。
 
 ### 硬規則
 
-1. **禁止**用 `pythonw`（無視窗）+ `start`（脫離父行程）的組合啟動。
-   這個模式是 EDR 最明顯的觸發點，而且**完全沒有必要**。
-2. 啟動腳本**保留可見主控台**。畫面上的訊息也是唯一的即時狀態來源。
-3. 真的要不顯示視窗，用 `.lnk` 捷徑指向 `pythonw.exe` ——
-   那是正常的應用程式模式，比 `.cmd` + `start` 自然。
-4. **不要**為了繞過防毒而加混淆、加密、或動態載入程式碼。
-   那會讓它從「誤判」變成「真的像惡意程式」，而且違反本專案的透明原則。
+1. **不要用 PowerShell 抓 UI 頁面**（`Invoke-WebRequest` / `Invoke-RestMethod` 取 HTML）。
+   要驗證靜態檔就**直接讀檔**，或用 Python；要開 UI 就用瀏覽器。
+2. **JS 不要寫在 HTML 裡**。已分離為 `app/ui/app.js` ——
+   inline script 會讓「下載網頁」更容易被 AMSI 規則盯上，分開也更好維護。
+3. **不要**用 `pythonw`（無視窗）+ `start`（脫離父行程）。
+   雖然**不是這次的原因**，但這個組合沒有必要、本來就比較可疑，
+   而且複雜度換不到任何好處。
+4. **不要**為了繞過防毒而加混淆、加密、動態載入程式碼。
+   那會讓它從誤判變成真的像惡意程式，也違反本專案「可稽核」的定位。
 
-### 認知
+### 尚未驗證的風險（不要當成已經沒事）
 
-**換成 Rust 不會解決這件事。** 原生二進位做同樣四件事一樣被擋，
-而且未簽章的執行檔通常被對待得更嚴。
-這是**產品層級約束**，不是選棧問題 —— 受管理的公司電腦需要 IT 開例外。
+**目前還沒觀察到**針對「攔截全系統鍵盤 + 注入按鍵 + 讀剪貼簿」的
+**行為**規則。但這不等於不會被擋，只是還沒踩到。
+在**受管理的公司電腦**上，這類工具本來就常需要 IT 開例外。
+
+**換成 Rust 不會改變這件事**（原生二進位做同樣的事一樣可疑，
+未簽章通常被對待得更嚴）。這是**部署層級**問題，不是選棧問題。
+
+---
+
+## 8.6 ⚠️ 批次檔必須「純 ASCII + CRLF」（實測踩到）
+
+`啟動 VibeTalkie.cmd` 曾經被 `cmd.exe` **切碎成亂碼指令**：
+
+```
+'???rem' 不是內部或外部命令…
+'thon' 不是內部或外部命令…
+'o.'   不是內部或外部命令…
+```
+
+**兩個原因，兩個都要修：**
+
+| 問題 | 為什麼 cmd 受不了 |
+|---|---|
+| 檔案內含**中文**（292 個非 ASCII 位元組） | cmd 用**主控台代碼頁**讀檔案，不是 UTF-8。`chcp 65001` 也救不了已經被誤讀的位元組 |
+| **LF 換行**（30 個裸 LF、0 個 CRLF） | cmd 的批次解析器要 CRLF；LF-only 會讓它把行切錯 |
+
+**規則：**
+
+1. `.cmd` / `.bat` 一律**只放 ASCII**。所有中文訊息都放進 Python（`launch.py`），
+   那邊有完整的 UTF-8 處理。
+2. `.cmd` / `.bat` 一律 **CRLF**（`.gitattributes` 已設定 `eol=crlf`，
+   但**寫入檔案時就要是 CRLF** —— git 只在你 checkout 時才轉換）。
+3. 相對地，`.command` / `.sh`（bash）要 **LF**，而且 bash 處理 UTF-8 沒問題。
+
+**自我檢查指令**（改完批次檔就跑一次）：
+
+```powershell
+$b = [IO.File]::ReadAllBytes("VibeTalkie.cmd")
+$lf = 0; $crlf = 0
+for ($i=0; $i -lt $b.Length; $i++) {
+  if ($b[$i] -eq 10) { if ($i -gt 0 -and $b[$i-1] -eq 13) { $crlf++ } else { $lf++ } }
+}
+"CRLF=$crlf 裸LF=$lf 非ASCII=$(($b | ? { $_ -gt 127 }).Count)"
+# 期望：裸LF=0，非ASCII=0
+```
+
+**另一個坑：** Windows 主控台預設 cp950，`print("✗")` 這種字符**編不出來**，
+會直接 `UnicodeEncodeError` 崩潰 —— 結果是「錯誤訊息本身造成錯誤」。
+所有進入點都必須先 `SetConsoleOutputCP(65001)` + `reconfigure(encoding="utf-8")`。
+（`launch.py` 曾經漏掉，已補。）
+
+
 
 ---
 
