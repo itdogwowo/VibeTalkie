@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VibeTalkie</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#262d3a;
+    --fg:#e6edf3; --dim:#8b949e; --accent:#4f9cf9; --ok:#3fb950;
+    --warn:#d29922; --err:#f85149; --rec:#ff4d4d;
+    --radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.6 "Segoe UI","Noto Sans TC",system-ui,-apple-system,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:28px 20px 60px}
+
+  header{display:flex;align-items:center;gap:14px;margin-bottom:26px}
+  .logo{
+    width:38px;height:38px;border-radius:10px;flex:0 0 auto;
+    background:linear-gradient(135deg,var(--accent),#8b5cf6);
+    display:grid;place-items:center;font-size:19px;
+  }
+  h1{font-size:19px;margin:0;font-weight:650;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:12.5px;margin-top:1px}
+
+  /* 狀態燈 */
+  .status{
+    display:flex;align-items:center;gap:16px;background:var(--panel);
+    border:1px solid var(--line);border-radius:var(--radius);
+    padding:18px 20px;margin-bottom:18px;
+  }
+  .dot{
+    width:13px;height:13px;border-radius:50%;background:var(--dim);
+    flex:0 0 auto;transition:background .18s;
+  }
+  .dot.idle{background:var(--ok);box-shadow:0 0 0 4px rgba(63,185,80,.14)}
+  .dot.recording{background:var(--rec);animation:pulse 1s infinite}
+  .dot.processing,.dot.inserting{background:var(--warn);animation:pulse 1s infinite}
+  .dot.error{background:var(--err)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .statetext{font-size:16px;font-weight:600}
+  .statemeta{color:var(--dim);font-size:12.5px}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{
+    background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius);padding:18px 20px;
+  }
+  .card h2{
+    font-size:13px;text-transform:uppercase;letter-spacing:.9px;
+    color:var(--dim);margin:0 0 14px;font-weight:600;
+  }
+  .row{display:flex;justify-content:space-between;align-items:center;
+       padding:9px 0;border-bottom:1px solid var(--line);gap:12px}
+  .row:last-child{border-bottom:0}
+  .row .k{color:var(--dim);flex:0 0 auto}
+  .row .v{text-align:right;word-break:break-all;font-variant-numeric:tabular-nums}
+  .kv{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+
+  select,input[type=text]{
+    background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:8px;padding:7px 10px;font:inherit;min-width:150px;
+  }
+  select:focus,input:focus{outline:none;border-color:var(--accent)}
+  label.switch{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none}
+  input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);cursor:pointer}
+
+  button{
+    background:var(--accent);color:#fff;border:0;border-radius:8px;
+    padding:9px 16px;font:inherit;font-weight:600;cursor:pointer;
+  }
+  button:hover{filter:brightness(1.1)}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
+
+  #log{max-height:230px;overflow:auto}
+  .entry{padding:10px 0;border-bottom:1px solid var(--line)}
+  .entry:last-child{border-bottom:0}
+  .entry .txt{font-size:15px;margin-bottom:3px}
+  .entry .meta{color:var(--dim);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .empty{color:var(--dim);text-align:center;padding:22px 0;font-size:13px}
+
+  .note{
+    margin-top:16px;padding:12px 16px;border-radius:10px;font-size:12.5px;
+    background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.35);
+    color:#e3b341;
+  }
+  .foot{margin-top:26px;color:var(--dim);font-size:11.5px;text-align:center}
+  .bar{height:4px;background:var(--panel2);border-radius:2px;overflow:hidden;margin-top:10px}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .08s linear}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">🎙️</div>
+    <div>
+      <h1>VibeTalkie</h1>
+      <div class="sub">按住錄音鍵說話，放開就出字 · 全本機辨識</div>
+    </div>
+  </header>
+
+  <div class="status">
+    <span class="dot" id="dot"></span>
+    <div style="flex:1">
+      <div class="statetext" id="state">連線中…</div>
+      <div class="statemeta" id="statemeta">正在連上本機服務</div>
+    </div>
+    <div style="text-align:right">
+      <div class="statemeta">本次啟動</div>
+      <div class="kv" id="counters">—</div>
+    </div>
+  </div>
+  <div class="bar"><i id="level"></i></div>
+
+  <div class="grid" style="margin-top:16px">
+
+    <div class="card">
+      <h2>裝置</h2>
+      <div class="row">
+        <span class="k">麥克風</span>
+        <select id="device"></select>
+      </div>
+      <div class="row">
+        <span class="k">觸發鍵</span>
+        <span class="v kv">Right Ctrl（裝置原生）</span>
+      </div>
+      <div class="row">
+        <span class="k">辨識引擎</span>
+        <span class="v kv" id="engine">—</span>
+      </div>
+      <div class="row">
+        <span class="k">模型</span>
+        <span class="v kv" id="model">—</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>輸出</h2>
+      <div class="row">
+        <span class="k">繁體輸出</span>
+        <label class="switch"><input type="checkbox" id="trad"><span>簡體轉繁體</span></label>
+      </div>
+      <div class="row">
+        <span class="k">注入方式</span>
+        <select id="mode">
+          <option value="auto">自動（貼上，失敗則逐字）</option>
+          <option value="paste">只用剪貼簿貼上</option>
+          <option value="type">只用逐字輸入</option>
+        </select>
+      </div>
+      <div class="row">
+        <span class="k">還原剪貼簿</span>
+        <label class="switch"><input type="checkbox" id="restore" checked disabled><span>一律還原</span></label>
+      </div>
+      <div class="row">
+        <button id="save">儲存設定</button>
+        <span class="kv" id="saved" style="color:var(--ok)"></span>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column:1/-1">
+      <h2>最近辨識</h2>
+      <div id="log"><div class="empty">還沒有紀錄 —— 按住錄音鍵說一句話試試</div></div>
+    </div>
+
+  </div>
+
+  <div class="note" id="vendor" style="display:none"></div>
+
+  <div class="foot">
+    <span id="latency"></span>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const STATE_TEXT = {
+  idle:      ["待命", "按住錄音鍵說話"],
+  recording: ["錄音中…", "放開錄音鍵結束"],
+  processing:["辨識中…", "正在跑本機模型"],
+  inserting: ["注入中…", "寫入前景視窗"],
+  error:     ["發生錯誤", "請看下方訊息"],
+};
+
+let lastCount = -1;
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function render(s){
+  const [name, meta] = STATE_TEXT[s.state] || ["未知", s.state];
+  $("state").textContent = name;
+  $("statemeta").textContent = meta;
+  $("dot").className = "dot " + s.state;
+
+  $("counters").textContent =
+    `按 ${s.presses} · 成功 ${s.inserted} · 空 ${s.empty} · 失敗 ${s.failed}`;
+  $("engine").textContent = s.engine || "—";
+  $("model").textContent = s.model || "—";
+
+  if(s.latency_ms) $("latency").textContent =
+    `最近一次：放開到文字出現 ${s.latency_ms} ms（辨識 ${s.asr_ms} + 貼上 ${s.paste_ms}）`;
+
+  const log = $("log");
+  if(s.history && s.history.length !== lastCount){
+    lastCount = s.history.length;
+    log.innerHTML = s.history.length
+      ? s.history.map(h => `<div class="entry">
+           <div class="txt">${esc(h.text)}</div>
+           <div class="meta">${h.time} · ${h.ms} ms · ${h.chars} 字</div>
+         </div>`).join("")
+      : '<div class="empty">還沒有紀錄 —— 按住錄音鍵說一句話試試</div>';
+  }
+
+  if(s.vendor_warning){
+    $("vendor").style.display = "block";
+    $("vendor").textContent = s.vendor_warning;
+  } else {
+    $("vendor").style.display = "none";
+  }
+}
+
+function esc(t){
+  return String(t).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function tick(){
+  try{
+    const s = await api("/api/status");
+    render(s);
+  }catch(e){
+    $("state").textContent = "連不上本機服務";
+    $("statemeta").textContent = "請確認 VibeTalkie 還在執行";
+    $("dot").className = "dot error";
+  }
+}
+
+async function loadConfig(){
+  const c = await api("/api/config");
+  $("trad").checked = !!c.traditional;
+  $("mode").value = c.mode || "auto";
+  const sel = $("device");
+  // device index 會隨藍牙重連改變，所以 value 用 index、但同時帶上 name，
+  // 存檔時以 name 為主要識別（見 app/vibetalkie.py 的 resolve_device）。
+  const want = c.mic_name || "";
+  sel.innerHTML = (c.devices||[]).map(d => {
+    const on = (want && d.name === want) ||
+               (!want && d.index === c.device_index);
+    return `<option value="${d.index}" data-name="${esc(d.name)}" ${on?"selected":""}>${esc(d.name)}</option>`;
+  }).join("") || '<option>找不到音訊裝置</option>';
+}
+
+$("save").onclick = async () => {
+  const sel = $("device");
+  const opt = sel.options[sel.selectedIndex];
+  await api("/api/config", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      traditional: $("trad").checked,
+      mode: $("mode").value,
+      device_index: parseInt(sel.value,10),
+      mic_name: opt ? (opt.dataset.name || "") : "",
+    })
+  });
+  $("saved").textContent = "已儲存 ✓";
+  setTimeout(()=> $("saved").textContent = "", 2000);
+};
+
+loadConfig().catch(()=>{});
+tick();
+setInterval(tick, 500);
+</script>
+</body>
+</html>

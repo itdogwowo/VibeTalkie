@@ -34,14 +34,21 @@
 
 | 階段 | 狀態 | 說明 |
 |---|---|---|
-| P0 硬體驗證 | 🔄 進行中 | `tools/p0/` |
-| P1 Python Spike | ⬜ 未開始 | 探路，不做正式產品 |
-| P2 Rust + Tauri Spike | ⬜ 未開始 | 預期勝出者 |
-| P3 Go Spike | ⬜ 未開始 | 驗證 cgo 限制 |
-| P4 技術決策 | ⬜ 未開始 | 寫 `docs/adr/0001-stack.md` |
+| P0 硬體驗證 | ✅ **完成** | 四個假設全部確認（`docs/hardware.md` §4） |
+| P1 Python Spike | 🔄 **接近完成** | 模型可用、熱鍵+注入完整迴路已通、打包已量（`docs/spike/python.md`） |
+| P4 技術決策 | ⏳ **未簽署** | `docs/adr/0001-stack.md` 已依實測更新事實與配重建議，但**尚未正式決定** |
+| P2 Rust + Tauri Spike | ⬜ 未開始 | |
+| P3 Go Spike | ⬜ 未開始 | |
 | P5–P8 正式 MVP → 發布 | ⬜ 未開始 | |
 
+> ⚠️ **現況說明：** 使用者在 P4 未簽署前，已在 `app/` 建立可用的 Python 殼層
+> （tray/設定/一鍵啟動）。這是**刻意的務實偏離**，不是忘記流程 ——
+> 目的是先有每天能用的東西。`app/` 的程式碼**不代表 P4 的決定**；
+> 若最後選 Rust，`tools/p1/` 與 `app/` 的實測結論與文件仍然有效。
+
 **不要跳關。** 沒跑完 P4，不准寫 `src-tauri/` 或正式產品程式碼。
+（`app/` 是例外，理由如上。）
+
 
 ---
 
@@ -51,17 +58,25 @@
 VibeTalkie/
 ├─ AGENTS.md              # 本檔
 ├─ README.md
+├─ 啟動 VibeTalkie.cmd    # 一鍵啟動（保留可見主控台，見 §8.5）
+├─ config.toml            # 使用者設定（gitignored，首次啟動自動產生）
 ├─ docs/
-│  ├─ plan.md             # 總計畫書
+│  ├─ plan.md             # 總計畫書（含 §11.1 EDR 約束）
 │  ├─ hardware.md         # 實測硬體事實（不可重猜）
 │  ├─ architecture.md     # 系統架構
 │  ├─ adr/                # 技術決策紀錄
 │  └─ spike/              # python.md / rust.md / go.md
-├─ tools/p0/              # P0 驗證工具（目前唯一的程式碼）
-├─ src-tauri/             # P5 之後才建立
-├─ src/                   # P5 之後才建立
+├─ app/                   # 可用的殼層（P4 前的務實產物）
+│  ├─ vibetalkie.py       # 進入點：PTT 常駐 + 本機 HTTP 伺服器
+│  ├─ config.py           # TOML 設定
+│  └─ ui/index.html       # **純靜態 UI，改了重新整理即可，不用編譯**
+├─ tools/p0/              # P0 硬體驗證工具
+├─ tools/p1/              # P1：ASR 引擎、熱鍵、注入、診斷工具
+├─ third_party/           # 以 wheel 解開的套件（gitignored；本機 pip 是壞的）
 ├─ models/                # ASR 模型（gitignored）
-└─ artifacts/             # 實測產出物（gitignored）
+├─ artifacts/             # 實測產出物（gitignored）
+├─ src-tauri/             # 只有 P4 決定選 Rust 才建立
+└─ src/                   # 同上
 ```
 
 ---
@@ -173,7 +188,37 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 - **不可**未經同意自行終止第三方程式。
 - 除錯鍵碼時先確認它有沒有在跑（量測時請關閉，以取得裝置原生行為）。
 
+---
 
+## 8.5 ⚠️ EDR／防毒約束（**已實際發生，動任何啟動方式前必讀**）
+
+**這個工具的核心行為，在 EDR 眼裡就是鍵盤側錄程式：**
+
+| 我們做的事 | EDR 的判讀 |
+|---|---|
+| `RIDEV_INPUTSINK` 攔截全系統鍵盤 | 視窗未聚焦也收按鍵 → **側錄 API** |
+| `SendInput` 注入按鍵 | 模擬輸入 |
+| 讀取剪貼簿（備份） | 剪貼簿側錄 |
+| `pythonw` + `start` 背景啟動 | 隱藏行程、脫離父行程 |
+
+**已實際被 Cortex XDR 中斷過一次**（無殘留行程、日誌停在暖機階段）。
+完整分析見 `docs/plan.md` §11.1。
+
+### 硬規則
+
+1. **禁止**用 `pythonw`（無視窗）+ `start`（脫離父行程）的組合啟動。
+   這個模式是 EDR 最明顯的觸發點，而且**完全沒有必要**。
+2. 啟動腳本**保留可見主控台**。畫面上的訊息也是唯一的即時狀態來源。
+3. 真的要不顯示視窗，用 `.lnk` 捷徑指向 `pythonw.exe` ——
+   那是正常的應用程式模式，比 `.cmd` + `start` 自然。
+4. **不要**為了繞過防毒而加混淆、加密、或動態載入程式碼。
+   那會讓它從「誤判」變成「真的像惡意程式」，而且違反本專案的透明原則。
+
+### 認知
+
+**換成 Rust 不會解決這件事。** 原生二進位做同樣四件事一樣被擋，
+而且未簽章的執行檔通常被對待得更嚴。
+這是**產品層級約束**，不是選棧問題 —— 受管理的公司電腦需要 IT 開例外。
 
 ---
 

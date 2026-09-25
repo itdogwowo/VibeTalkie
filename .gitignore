@@ -44,3 +44,7 @@ wheels/
 model_downloads/
 .piptmp/
 
+
+# ---- 使用者設定（首次啟動自動產生，含個人裝置名稱）----
+config.toml
+

@@ -83,7 +83,8 @@ class PttDaemon:
                  key_vk: int = VK_CONTROL, require_e0: bool = True,
                  traditional: bool = True, mode: str = "auto",
                  dry_run: bool = False, min_s: float = 0.2,
-                 max_s: float = 60.0, device_index: int = 1, debug: bool = False):
+                 max_s: float = 60.0, device_index: int = 1, debug: bool = False,
+                 on_state=None, on_result=None):
         self.engine = engine
         self.device_filter = device_filter.lower() if device_filter else None
         self.key_vk = key_vk
@@ -95,8 +96,13 @@ class PttDaemon:
         self.max_s = max_s
         self.device_index = device_index
         self.debug = debug
+        # 給 UI 用的回呼（可選）。不傳就只是純終端機模式。
+        self.on_state = on_state
+        self.on_result = on_result
 
-        self.state = "IDLE"
+        self._set_state("IDLE")
+        self.level = 0.0            # 錄音中的即時音量（0..1），UI 顯示用
+        self.last_latency = None    # 最近一次的延遲分解
         self._cap: Capture | None = None
         self._rec_started = 0.0
         self._pressed = False
@@ -123,23 +129,51 @@ class PttDaemon:
         return False, device_label(name)
 
     # ------------------------------------------------ 錄音 / 辨識 / 注入
+    def _set_state(self, state: str) -> None:
+        self.state = state
+        if self.on_state:
+            try:
+                self.on_state(state)
+            except Exception:
+                pass
+
+    def poll_level(self) -> float:
+        """錄音中即時音量（0..1），給 UI 的音量表用。"""
+        cap = self._cap
+        if cap is None:
+            return 0.0
+        data = cap.recorded()
+        n = len(data) // 2
+        if n < 160:                      # 少於 10ms 就不算
+            return self.level
+        import struct as _s
+        tail = data[-min(len(data), 16000):]        # 只看最近 0.5 秒
+        m = len(tail) // 2
+        s = _s.unpack(f"<{m}h", tail[:m * 2])
+        rms = (sum(v * v for v in s) / m) ** 0.5
+        # 對應到 0..1（-60 dBFS 以下當 0）
+        import math as _m
+        db = 20.0 * _m.log10(rms / 32768.0) if rms > 0 else -99.0
+        self.level = max(0.0, min(1.0, (db + 60.0) / 60.0))
+        return self.level
+
     def _start_recording(self, label: str) -> None:
         try:
             cap = Capture(self.device_index, rate=16000, max_seconds=self.max_s)
             cap.__enter__()
         except Exception as exc:
             print(f"  ❌ 無法開始錄音：{exc}")
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
         self._cap = cap
         self._rec_started = time.monotonic()
-        self.state = "RECORDING"
+        self._set_state("RECORDING")
         print(f"  🔴 錄音中…（{label}）", flush=True)
 
     def _finish_recording(self) -> None:
         cap, self._cap = self._cap, None
         if cap is None:
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
         duration = time.monotonic() - self._rec_started
         try:
@@ -147,7 +181,7 @@ class PttDaemon:
             pcm = cap.recorded()
         except Exception as exc:
             print(f"  ❌ 停止錄音失敗：{exc}")
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
 
         n = len(pcm) // 2
@@ -160,26 +194,26 @@ class PttDaemon:
             print("  ⚠️ 完全沒收到音訊 —— 藍牙音訊連線可能還沒建立好（見啟動時的暖機）")
             print("     請再按一次。若持續如此，用 --device-index 確認裝置索引。")
             self.stats["failed"] += 1
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
         if secs < self.min_s:
             print(f"  ⏭  太短（{secs:.2f}s < {self.min_s}s），視為誤觸，不辨識")
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
 
-        self.state = "PROCESSING"
+        self._set_state("PROCESSING")
         t0 = time.perf_counter()
         try:
             result = self.engine.transcribe(pcm_to_samples(pcm), 16000)
         except (EngineNotConfigured, EngineUnavailable) as exc:
             print(f"  ❌ 辨識失敗：{exc}")
             self.stats["failed"] += 1
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
         except Exception as exc:
             print(f"  ❌ 辨識發生未預期錯誤：{type(exc).__name__}: {exc}")
             self.stats["failed"] += 1
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
         asr_ms = (time.perf_counter() - t0) * 1000
 
@@ -187,7 +221,7 @@ class PttDaemon:
         if not text:
             print(f"  ⚠️ 沒有辨識出文字（{asr_ms:.0f} ms）")
             self.stats["empty"] += 1
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
 
         out = to_traditional(text) if (self.traditional and has_opencc()) else text
@@ -195,10 +229,10 @@ class PttDaemon:
 
         if self.dry_run:
             print("  （--dry-run：不注入）")
-            self.state = "IDLE"
+            self._set_state("IDLE")
             return
 
-        self.state = "INSERTING"
+        self._set_state("INSERTING")
         res = inject_text(out, mode=self.mode, verbose=True)
         if res["ok"]:
             self.stats["inserted"] += 1
@@ -211,10 +245,18 @@ class PttDaemon:
         # 分開回報：使用者感覺到的是「放開 → 文字出現」，
         # 也就是辨識 + 送出貼上；剪貼簿還原發生在之後，看不到。
         perceived = asr_ms + res.get("paste_ms", 0.0)
+        self.last_latency = {"total_ms": round(perceived), "asr_ms": round(asr_ms),
+                             "paste_ms": round(res.get("paste_ms", 0.0))}
         print(f"  ⏱  放開→文字出現 {perceived:.0f} ms"
               f"（辨識 {asr_ms:.0f} + 貼上 {res.get('paste_ms', 0):.0f}）"
               f"，剪貼簿還原另計 {res.get('restore_ms', 0):.0f} ms\n")
-        self.state = "IDLE"
+        if self.on_result and res["ok"]:
+            try:
+                self.on_result({"text": out, "ms": round(perceived),
+                                "chars": len(out), "method": res["method"]})
+            except Exception:
+                pass
+        self._set_state("IDLE")
 
     # ------------------------------------------------ Raw Input
     def _handle_key(self, hdevice, kb: RAWKEYBOARD) -> None:
