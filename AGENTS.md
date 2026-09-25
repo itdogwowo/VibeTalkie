@@ -89,6 +89,15 @@ VibeTalkie/
 │  ├─ p0/enumerate_audio.ps1            # T1 端點列舉
 │  └─ p1/                               # 診斷與一次性工具
 │     ├─ measure_bt_profile_switch.py   # 產出 hardware.md §2.2 的數據
+│     ├─ diagnose_bt_output.py          # §2.3：端點現況＋藍牙拓撲（誰跟誰共用無線電）
+│     ├─ measure_bt_playback.py         # §2.3：播放到底送不送得出去（waveOut 實測）
+│     ├─ measure_bt_stream_hold.py      # §2.4：串流常開 vs 每次開的中斷次數比較
+│     ├─ measure_bt_exclusive.py        # §2.5：錄音期間播放端點是否還開得起來（獨占性）
+│     ├─ measure_ptt_modes.py           # §2.4.1b：用真實 ptt.py 驅動三模式並對齊時間軸
+│     ├─ measure_session_reuse.py       # session 模式是否真的重用串流（查「每段都斷」）
+│     ├─ watch_bt_events.py             # 被動監看藍牙端點（邊用 app 邊看，會印出當前模式）
+│     ├─ eval_yue_models.py             # §7.1：多模型粵語對照（速度＋逐句並排輸出）
+│     ├─ record_eval_set.py             # §7.1：錄自己的評測語料（計時自動換句）
 │     ├─ measure_audio_latency.py       # 產出 hardware.md §2.1 的數據
 │     ├─ inspect_recordings.py          # 錄音品質診斷
 │     ├─ fetch_wheels.py                # 以 wheel 解開套件（本機 pip 壞了）

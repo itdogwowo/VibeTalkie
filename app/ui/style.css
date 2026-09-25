@@ -78,6 +78,23 @@ select,input[type=text],input[type=search]{
   border-radius:8px;padding:7px 10px;font:inherit;min-width:150px;
 }
 select:focus,input:focus{outline:none;border-color:var(--accent)}
+input[type=number]{
+  background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:8px;padding:7px 10px;font:inherit;font-variant-numeric:tabular-nums;
+}
+input[type=number]:focus{outline:none;border-color:var(--accent)}
+
+/* 麥克風串流模式：單選清單。用 label 包住整個區塊，整塊可點。 */
+.modeopt{
+  display:block;border:1px solid var(--line);border-radius:10px;
+  padding:11px 13px;margin-bottom:9px;cursor:pointer;user-select:none;
+  background:var(--panel2);transition:border-color .12s;
+}
+.modeopt:hover{border-color:var(--accent)}
+.modeopt input{margin-right:9px;accent-color:var(--accent)}
+.modeopt .t{font-weight:600}
+.modeopt .n{color:var(--dim);font-size:12px;line-height:1.6;margin:5px 0 0 26px}
+.modeopt.on{border-color:var(--accent)}
 label.switch{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none}
 input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);cursor:pointer}
 

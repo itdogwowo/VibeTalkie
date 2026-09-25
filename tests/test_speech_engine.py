@@ -143,6 +143,77 @@ def test_engine_both_paths() -> None:
     check("耗時有量到", from_file.latency_ms > 0, f"{from_file.latency_ms:.0f} ms")
 
 
+def test_paraformer_kwarg() -> None:
+    """Paraformer 的建構參數名必須是 `paraformer=`，不是 `model=`。
+
+    實際踩到：`speech_engine._build()` 把 `from_sense_voice()` 的參數名
+    （`model=`）拿去餵 `from_paraformer()`，結果是
+
+        TypeError: from_paraformer() got an unexpected keyword argument 'model'
+
+    而設定介面**列得出 Paraformer 模型**，使用者下載完卻完全載不起來。
+    這種「介面說有、實際壞掉」的 bug 用眼睛看不出來，所以用測試釘住。
+
+    這裡不載入真的模型（太慢），只檢查**呼叫參數**。
+    """
+    print("\n[7] Paraformer 建構參數名（實際踩到的 bug）")
+    import inspect
+
+    import sherpa_onnx
+    from speech_engine import SenseVoiceEngine
+
+    sig = inspect.signature(sherpa_onnx.OfflineRecognizer.from_paraformer)
+    check("from_paraformer 的第一個參數叫 paraformer",
+          "paraformer" in sig.parameters, str(list(sig.parameters)[:3]))
+    check("from_paraformer **沒有** model 參數",
+          "model" not in sig.parameters)
+
+    sig_sv = inspect.signature(sherpa_onnx.OfflineRecognizer.from_sense_voice)
+    check("from_sense_voice 用的是 model 參數", "model" in sig_sv.parameters)
+
+    # 直接驗證 _build() 真的會用對的名字：攔截 sherpa_onnx 的工廠函式
+    import sherpa_onnx as so
+    calls: dict[str, dict] = {}
+    orig_pf, orig_sv = so.OfflineRecognizer.from_paraformer, so.OfflineRecognizer.from_sense_voice
+
+    def fake_pf(**kw):
+        calls["paraformer"] = kw
+        raise RuntimeError("stop-here")      # 不要真的建模型
+
+    def fake_sv(**kw):
+        calls["sense_voice"] = kw
+        raise RuntimeError("stop-here")
+
+    so.OfflineRecognizer.from_paraformer = staticmethod(fake_pf)
+    so.OfflineRecognizer.from_sense_voice = staticmethod(fake_sv)
+    try:
+        fake_dir = MODEL_DIR
+        eng = SenseVoiceEngine(model_dir=fake_dir, kind="paraformer")
+        eng._model_file = lambda: fake_dir / "dummy.onnx"      # 繞過檔案檢查
+        try:
+            eng._build()
+        except RuntimeError:
+            pass
+        kw = calls.get("paraformer") or {}
+        check("_build() 傳給 from_paraformer 的是 paraformer=",
+              "paraformer" in kw, f"實際鍵：{sorted(kw)}")
+        check("_build() 沒有誤傳 model=", "model" not in kw, f"實際鍵：{sorted(kw)}")
+
+        calls.clear()
+        eng2 = SenseVoiceEngine(model_dir=fake_dir, kind="sense_voice")
+        eng2._model_file = lambda: fake_dir / "dummy.onnx"
+        try:
+            eng2._build()
+        except RuntimeError:
+            pass
+        kw2 = calls.get("sense_voice") or {}
+        check("_build() 對 sense_voice 仍用 model=", "model" in kw2,
+              f"實際鍵：{sorted(kw2)}")
+    finally:
+        so.OfflineRecognizer.from_paraformer = orig_pf
+        so.OfflineRecognizer.from_sense_voice = orig_sv
+
+
 def main() -> int:
     try:
         import ctypes
@@ -165,6 +236,7 @@ def main() -> int:
     test_status()
     test_opencc()
     test_engine_both_paths()
+    test_paraformer_kwarg()
 
     print("\n" + "=" * 70)
     if failures:

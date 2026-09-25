@@ -42,6 +42,23 @@
     </div>
     <div class="bar"><i id="level"></i></div>
 
+    <div class="card">
+      <h2>藍牙干擾模式（目前生效中）</h2>
+      <div class="row"><span class="k">麥克風串流</span>
+        <span class="v" id="micstream-now">—</span></div>
+      <div class="row"><span class="k">串流現在開著嗎</span>
+        <span class="v" id="mic-open">—</span></div>
+      <div class="hint" style="margin:0">
+        這裡顯示的是**程式現在真正在做的**，不是設定頁裡選的。<br>
+        · <span class="kv">session</span>：按過一次之後「開著」會**一直維持是**
+        （代表耳機那段時間聽不到聲音）<br>
+        · <span class="kv">idle_timeout</span>：放開後會維持「開著」，直到逾時才變「已關閉」，
+        那一刻耳機會恢復<br>
+        · <span class="kv">per_press</span>：平時都是「已關閉」，只有錄音時是「開著」<br>
+        若這裡顯示的模式不是你要的，代表設定還沒生效 —— 回設定頁按「儲存設定」。
+      </div>
+    </div>
+
     <div class="card" style="margin-top:16px">
       <h2>最近辨識</h2>
       <div id="log"><div class="empty">還沒有紀錄 —— 按住錄音鍵說一句話試試</div></div>
@@ -119,12 +136,43 @@
         「句號」有多種寫法（<span class="kv">。．.｡</span>），全部都會移除；
         只處理結尾，不動句中的標點。
       </div>
+    <div class="card">
+      <h2>藍牙干擾</h2>
+      <div class="hint" style="margin:0 0 12px">
+        開麥克風會讓藍牙耳機的播放中斷 —— 這是藍牙無線電的硬限制，
+        不是程式的 bug（實測見 <span class="kv">docs/hardware.md §2.2</span>）。
+        差別只在「斷幾次」，所以做成你可以自己選。
+      </div>
+      <div id="micstream"></div>
+      <div class="row" id="idlerow" style="display:none">
+        <span class="k">閒置幾秒後關閉</span>
+        <input type="number" id="idlesecs" min="5" max="120" step="1" style="width:80px">
+      </div>
+      <div class="hint" id="idlehint" style="display:none;margin:0 0 10px">
+        ⚠️ 這個值**必須比你講話時的停頓長**，否則每次放開都會斷一次，
+        就等同「每次按下才開」了。實測 2 秒太短（等於沒有效果），
+        一般交談建議 <span class="kv">8–15 秒</span>；最短只接受 5 秒。
+      </div>
+      <details class="hint" style="margin:4px 0 12px">
+        <summary style="cursor:pointer">實測結果（使用者聽感 + 端點監看）</summary>
+        <div style="margin-top:8px;line-height:1.9">
+          每次按下才開：<b>每段錄音斷一次</b>（耳機重連 6–8 秒）<br>
+          開著不關：<b>零中斷</b>，而且播放正常 ← 建議<br>
+          放開後等幾秒才關：逾時比講話停頓長才有效，否則每段仍會斷<br>
+          <span style="opacity:.8">量測工具：<span class="kv">tools/p1/watch_bt_events.py</span>、
+          <span class="kv">measure_ptt_modes.py</span></span>
+        </div>
+      </details>
       <div class="row">
         <button id="save">儲存設定</button>
         <span class="kv" id="saved" style="color:var(--ok)"></span>
       </div>
       <div class="hint" style="margin:12px 0 0">
-        以上設定**存檔後立即生效，不需要重啟**。
+        按「儲存設定」會**立即生效，不需要重啟**。<br>
+        ⚠️ 若你改成**直接編輯 <span class="kv">config.toml</span>**，
+        存檔後也會生效（程式會偵測檔案變動）。但要注意：之後只要按一次
+        「儲存設定」，就會用這一頁顯示的值把檔案覆蓋掉。<br>
+        → 不確定現在跑哪個模式，看**狀態頁的「藍牙干擾模式（目前生效中）」**。
       </div>
     </div>
   </section>

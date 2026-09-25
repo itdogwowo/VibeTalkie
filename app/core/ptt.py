@@ -86,7 +86,8 @@ class PttDaemon:
                  dry_run: bool = False, min_s: float = 0.2,
                  max_s: float = 60.0, device_index: int = 1, debug: bool = False,
                  on_state=None, on_result=None, device_provider=None,
-                 remove_period: bool = True, cfg_provider=None):
+                 remove_period: bool = True, cfg_provider=None,
+                 config_path: Path | None = None, config_loader=None):
         self.engine = engine
         self.device_filter = device_filter.lower() if device_filter else None
         self.key_vk = key_vk
@@ -102,6 +103,10 @@ class PttDaemon:
         # 傳 None 就用固定的 device_index（純終端機模式）。
         self.device_provider = device_provider
         self.cfg_provider = cfg_provider
+        # 設定檔路徑 + 上次看到的 mtime：用來偵測「使用者手改檔案」並即時套用
+        self.config_path = config_path
+        self.config_loader = config_loader    # 由呼叫端注入，避免 ptt 直接依賴 config 模組
+        self._cfg_mtime: float | None = None
         self.debug = debug
         # 給 UI 用的回呼（可選）。不傳就只是純終端機模式。
         self.on_state = on_state
@@ -111,6 +116,10 @@ class PttDaemon:
         self.level = 0.0            # 錄音中的即時音量（0..1），UI 顯示用
         self.last_latency = None    # 最近一次的延遲分解
         self._cap: Capture | None = None
+        # 麥克風串流常駐時的「這一段已經播到哪裡了」——每次錄音從這裡往後切
+        self._cap_seen = 0
+        self._mic_device: int | None = None   # 目前串流開在哪個裝置（UI 顯示用）
+        self._idle_at: float | None = None   # 上次放開的時間（idle_timeout 用）
         self._rec_started = 0.0
         self._pressed = False
         self._lock = threading.Lock()
@@ -159,16 +168,200 @@ class PttDaemon:
         """
         fallback = {"traditional": self.traditional,
                     "remove_period": self.remove_period,
-                    "mode": self.mode}
+                    "mode": self.mode,
+                    "mic_stream": "per_press",
+                    "idle_timeout_s": 7.0}
         if self.cfg_provider is None:
             return fallback
         try:
             c = self.cfg_provider()
             return {"traditional": bool(getattr(c, "traditional", True)),
                     "remove_period": bool(getattr(c, "remove_trailing_period", True)),
-                    "mode": getattr(c, "mode", "auto") or "auto"}
+                    "mode": getattr(c, "mode", "auto") or "auto",
+                    "mic_stream": getattr(c, "mic_stream", "per_press") or "per_press",
+                    "idle_timeout_s": float(getattr(c, "idle_timeout_s", 7.0) or 7.0)}
         except Exception:
             return fallback
+
+    # ------------------------------------------------ 麥克風串流生命週期
+    # 為什麼要有三種模式：藍牙的 A2DP（播放）與 SCO（麥克風）在同一顆無線電上
+    # 互斥，開麥克風會把耳機踢掉（docs/hardware.md §2.2–2.5，已實測）。
+    # 開串流的**時機**是我們唯一能控制的事，所以做成可選：
+    #
+    #   per_press   每次按下才開、放開就關   → 播放最不受影響，但每按一次都斷
+    #   session     整段常開到程式結束       → 只斷一次，但期間完全沒聲音
+    #   idle_timeout 放開後等 N 秒才關       → 連講好幾句不會被斷，停下來聲音就回來
+    def _close_capture(self, why: str = "") -> None:
+        """關掉麥克風串流（並清掉常駐狀態）。任何路徑都安全。
+
+        `why` 只影響除錯輸出。**為什麼要記原因**：實測踩到「串流被反覆關閉又
+        重開」卻查不出是誰關的 —— 三個呼叫點（模式切換、裝置變更、idle 逾時、
+        程式結束）長得都一樣。有了原因，日誌就能直接指出兇手。
+        """
+        cap, self._cap = self._cap, None
+        self._cap_seen = 0
+        self._mic_device = None
+        if cap is not None:
+            if self.debug:
+                print(f"  (debug) 關閉麥克風串流（{why or '未標明'}）", flush=True)
+            try:
+                cap.__exit__(None, None, None)
+            except Exception as exc:
+                if self.debug:
+                    print(f"  · 關閉麥克風串流失敗：{exc}")
+
+    def _ensure_capture(self) -> Capture:
+        """取得一個可用的擷取物件。
+
+        - `per_press`：每次呼叫都開一個新的（呼叫端負責關）。
+        - 其他模式：串流常駐，重複使用同一個；關閉只由 idle 逾時或程式結束負責。
+
+        為什麼要記錄 `_cap_seen`：串流常駐時 `recorded()` 會一直累積，
+        所以每次開始錄音要記下「目前為止的長度」，結束時只取後面新增的部分。
+        """
+        mode = self._live()["mic_stream"]
+        want = self.current_device()
+        if mode != "per_press" and self._cap is not None:
+            have = getattr(self._cap, "device_id", None)
+            if have == want:
+                self._cap_seen = len(self._cap.recorded())
+                if self.debug:
+                    print(f"  (debug) 沿用既有串流（device={have}, 已收 "
+                          f"{self._cap_seen} bytes）", flush=True)
+                return self._cap
+            # ⚠️ 這裡是「每按一次就重開串流」的頭號嫌疑：裝置索引一變就重開。
+            # 除錯輸出要能讓我們分辨是「索引真的變了」還是「比對邏輯有問題」。
+            if self.debug:
+                print(f"  (debug) 串流 device_id={have} 與目前解析到的 {want} 不符"
+                      f" → 關掉重開", flush=True)
+            self._close_capture("裝置索引變更")
+        elif mode == "per_press" and self.debug and self._cap is not None:
+            print(f"  (debug) per_press 模式但仍有殘留串流 → 先關掉", flush=True)
+            self._close_capture("per_press 殘留")
+
+        cap = Capture(want, rate=16000, max_seconds=self.max_s)
+        cap.__enter__()
+        self._mic_device = want
+        if self.debug:
+            print(f"  (debug) 開啟麥克風串流（mode={mode}, device={want}）", flush=True)
+        if mode == "per_press":
+            return cap
+        self._cap = cap
+        self._cap_seen = len(cap.recorded())
+        return cap
+
+    def _tick_idle(self, timeout_s: float) -> None:
+        """idle_timeout 模式：放開後閒置超過 N 秒就關掉串流，讓聲音回來。"""
+        if self._idle_at is None or self._cap is None:
+            return
+        if self.state != "IDLE":            # 錄音／辨識中都別關
+            return
+        if time.monotonic() - self._idle_at >= timeout_s:
+            self._close_capture(f"閒置逾時 {timeout_s:g}s")
+            self._idle_at = None
+
+    def _sync_config(self) -> None:
+        """偵測 `config.toml` 被改動就重新載入（讓手改檔案也能生效）。
+
+        ## 為什麼需要這個
+
+        實際踩到：使用者在 UI 把 `mic_stream` 改成 `session`，卻聽到跟
+        `idle_timeout` 一樣的結果 —— 因為他改的是**檔案**，而 app 只在啟動時
+        讀一次設定。**執行中的行程完全不知道檔案變了。**
+
+        更糟的是後續的「儲存設定」：UI 把表單上的值寫回檔案，
+        就把他手改的 session 覆蓋掉了 —— 使用者看到的是「我的設定被吃掉了」。
+
+        ## 為什麼要就地更新（不能整個換掉）
+
+        `cfg_provider` 與 UI 都握著**同一個物件**。若改成 `self.cfg = 新物件`，
+        provider 還指著舊的 → 兩邊不同步（UI 顯示 A、實際跑 B）。
+        所以這裡逐欄位覆蓋，物件身分不變。
+
+        ⚠️ 只在 mtime 真的變了才重讀，而且**忽略解析錯誤** ——
+        使用者可能正存到一半，讀到壞檔不該讓程式崩掉。
+
+        載入器由呼叫端注入（`config_loader`），這樣 `ptt.py` 不必直接
+        import `config` 模組 —— 否則就得賭 `app/` 剛好在 sys.path 上。
+        """
+        if self.config_path is None or self.config_loader is None:
+            return
+        try:
+            mtime = self.config_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._cfg_mtime:
+            return
+        self._cfg_mtime = mtime
+        if self.cfg_provider is None:
+            return
+        try:
+            fresh = self.config_loader(self.config_path)
+        except Exception as exc:
+            if self.debug:
+                print(f"  · 設定檔重讀失敗（忽略）：{exc}")
+            return
+        target = self.cfg_provider()
+        if target is None:
+            return
+        changed = []
+        # ⚠️ 這份清單就是「手改檔案會不會生效」的完整定義。
+        # 實測踩到：漏了 `model_dir` → 使用者把 config.toml 改成粵語專門模型，
+        # `ptt.py` 這邊（模式、裝置）都跟著變了，**但模型沒有** ——
+        # 執行中的 app 一直用啟動時載入的舊模型，使用者聽到的卻是舊模型的效果，
+        # 於是誤判「換模型沒用」。**只要改了設定檔就是改了，全部都要同步。**
+        for name in ("traditional", "remove_trailing_period", "mode",
+                     "mic_stream", "idle_timeout_s", "device_index", "mic_name",
+                     "engine", "model_dir", "language", "threads"):
+            if not hasattr(fresh, name):
+                continue
+            new = getattr(fresh, name)
+            if getattr(target, name, None) != new:
+                setattr(target, name, new)
+                changed.append(f"{name}={new}")
+        if changed and self.debug:
+            print(f"  · 設定檔已重新載入：{', '.join(changed)}")
+
+    def _tick_model(self) -> None:
+        """設定檔換了模型就重新載入引擎（只在待命時做）。
+
+        ## 為什麼需要這個
+
+        `SpeechEngine._ensure_loaded()` **只在第一次載入** —— 它不會因為
+        `model_dir` 被改就換模型。所以光把設定同步過來是不夠的，
+        必須有人主動呼叫 `engine.reload()`。
+
+        實際踩到的症狀：使用者把 `config.toml` 改成粵語專門模型，
+        設定檔同步了（模式、裝置都變了），**但模型還是舊的** ——
+        他聽到的是舊模型的效果，於是誤判「換模型沒用、尾音字還是掉」。
+        這種「一半生效」的狀態最難查，因為畫面上看不出來。
+
+        ⚠️ **只在 IDLE 時換**：推論中把 recognizer 換掉會讓正在跑的辨識
+        拿到半個狀態（`speech_engine.reload()` 的 docstring 有寫）。
+        """
+        if self.engine is None or self.cfg_provider is None:
+            return
+        if self.state != "IDLE":
+            return
+        try:
+            want = str(getattr(self.cfg_provider(), "model_dir", "") or "")
+        except Exception:
+            return
+        if not want:
+            return
+        cur = getattr(self.engine, "model_dir", None)
+        cur_name = Path(cur).name if cur else ""
+        if cur_name == want or want == getattr(self, "_model_pending", None):
+            return
+        # 避免模型不存在時每 5ms 重試一次、把錯誤洗掉
+        self._model_pending = want
+        base = Path(cur).parent if cur else Path("models")
+        target = base / want
+        try:
+            self.engine.reload(target)
+            print(f"  · 已切換模型：{want}", flush=True)
+        except Exception as exc:
+            print(f"  ⚠️ 切換模型失敗（沿用目前模型）：{exc}", flush=True)
 
     # ------------------------------------------------ 錄音 / 辨識 / 注入
     def _set_state(self, state: str) -> None:
@@ -201,13 +394,14 @@ class PttDaemon:
 
     def _start_recording(self, label: str) -> None:
         try:
-            cap = Capture(self.current_device(), rate=16000, max_seconds=self.max_s)
-            cap.__enter__()
+            cap = self._ensure_capture()
         except Exception as exc:
             print(f"  ❌ 無法開始錄音：{exc}")
+            self._close_capture("開始錄音失敗")
             self._set_state("IDLE")
             return
         self._cap = cap
+        self._idle_at = None                 # 有動作了，取消閒置計時
         self._rec_started = time.monotonic()
         self._set_state("RECORDING")
         print(f"  🔴 錄音中…（{label}）", flush=True)
@@ -218,13 +412,24 @@ class PttDaemon:
             self._set_state("IDLE")
             return
         duration = time.monotonic() - self._rec_started
+        stream = self._live()["mic_stream"]
+        keep = stream != "per_press"          # 常駐模式：放開時**不關**串流
         try:
-            cap.__exit__(None, None, None)
-            pcm = cap.recorded()
+            if keep:
+                # 串流還在跑：只取「這次按下之後新增的」那一段
+                pcm = cap.recorded()[self._cap_seen:]
+            else:
+                cap.__exit__(None, None, None)
+                pcm = cap.recorded()
         except Exception as exc:
             print(f"  ❌ 停止錄音失敗：{exc}")
+            self._close_capture("停止錄音失敗")
             self._set_state("IDLE")
             return
+        if keep:
+            self._cap = cap
+            self._cap_seen = len(cap.recorded())
+            self._idle_at = time.monotonic()  # 開始算閒置，逾時才關
 
         n = len(pcm) // 2
         secs = n / 16000
@@ -422,7 +627,11 @@ class PttDaemon:
             所以改成**輪詢到有資料為止**，並把實測到的延遲印出來。
 
         回傳首次收到音訊的秒數；逾時回 None。
+
+        ⚠️ 在 `session` / `idle_timeout` 模式下**不關掉串流** ——
+        常駐模式的重點就是「只跟無線電協商一次」，暖機後關掉等於白白多斷一次。
         """
+        keep = self._live()["mic_stream"] != "per_press"
         try:
             print(f"  ⏳ 暖機麥克風（等藍牙音訊連線，最多 {timeout:.0f}s）…",
                   end="", flush=True)
@@ -435,7 +644,12 @@ class PttDaemon:
                     first = time.monotonic() - t0
                     break
                 time.sleep(0.05)
-            cap.__exit__(None, None, None)
+            if keep:
+                # 串流留著：後續每次錄音直接沿用，不再重新協商
+                self._cap = cap
+                self._cap_seen = len(cap.recorded())
+            else:
+                cap.__exit__(None, None, None)
         except Exception as exc:
             print(f" 失敗：{exc}")
             print("     錄音裝置可能被占用。若第一次按下收到 0 bytes，再按一次即可。")
@@ -473,16 +687,17 @@ class PttDaemon:
                           f"其中 WM_INPUT {self._input_count} 個", flush=True)
                 if deadline and time.monotonic() > deadline:
                     break
+                # 手改 config.toml 也要生效（不然設定會被「儲存設定」覆蓋掉）
+                self._sync_config()
+                # 設定檔換了模型就在待命時換掉引擎（否則只會換一半）
+                self._tick_model()
+                # idle_timeout 模式：閒置夠久就把串流關掉，讓藍牙播放回來
+                self._tick_idle(self._live()["idle_timeout_s"])
                 time.sleep(0.005)
         except KeyboardInterrupt:
             print("\n（使用者中斷）")
         finally:
-            if self._cap is not None:
-                try:
-                    self._cap.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._cap = None
+            self._close_capture("程式結束")
             if self._hwnd:
                 user32.DestroyWindow(self._hwnd)
             print(f"\n統計：按下 {self.stats['presses']} 次，"

@@ -83,6 +83,15 @@ function render(s) {
   $("statemeta").textContent = s.error || meta;
   setDot(s.state);
 
+  // 目前實際生效的麥克風串流模式。
+  // 為什麼要顯示：使用者改了設定卻聽到一樣的結果時，這一行是唯一能分辨
+  // 「設定沒生效」與「生效了但效果不如預期」的線索。
+  $("micstream-now").textContent = micStreamLabel(s.mic_stream);
+  const openTxt = s.mic_open === true ? "開著（會影響耳機）"
+    : (s.mic_open === false ? "已關閉（耳機正常）" : "—");
+  $("mic-open").textContent =
+    (s.mic_device != null ? openTxt + "　device " + s.mic_device : openTxt);
+
   $("counters").textContent =
     `按 ${s.presses} · 成功 ${s.inserted} · 空 ${s.empty} · 失敗 ${s.failed}`;
   $("m-engine").textContent = s.engine || "—";
@@ -285,12 +294,57 @@ $("refresh").onclick = () => {
 
 // ---------------------------------------------------------------- 設定
 
+// 麥克風串流模式：選項與說明全部由後端提供（config.py 的 MIC_STREAM_OPTIONS），
+// UI 不自己寫一份，避免兩邊的說明漂移。
+function micStreamLabel(value) {
+  if (!value) return "—";
+  const opts = (configCache && configCache.mic_stream_options) || [];
+  const hit = opts.find(o => o.value === value);
+  return hit ? hit.label : value;
+}
+
+function renderMicStream(c) {
+  const box = $("micstream");
+  const opts = c.mic_stream_options || [];
+  const cur = c.mic_stream || "per_press";
+  box.innerHTML = opts.map((o, i) => `
+    <label class="modeopt${o.value === cur ? " on" : ""}">
+      <input type="radio" name="micstream" value="${esc(o.value)}"${o.value === cur ? " checked" : ""}>
+      <span class="t">${esc(o.label)}</span>
+      <div class="n">${esc(o.note)}</div>
+    </label>`).join("") || `<div class="hint">
+      ⚠️ 讀不到模式選項（後端沒有回 mic_stream_options）。<br>
+      你正在跑的可能是舊版程式 —— 請關掉 VibeTalkie 再重新啟動。
+    </div>`;
+  if (!opts.length) {
+    // 沒有選項就沒東西可選。明講原因，不要讓設定頁看起來正常但其實壞了。
+    $("idlerow").style.display = "none";
+    $("idlehint").style.display = "none";
+    return;
+  }
+
+  const sync = () => {
+    const picked = box.querySelector("input[name=micstream]:checked");
+    box.querySelectorAll(".modeopt").forEach(el => {
+      el.classList.toggle("on", el.querySelector("input").checked);
+    });
+    $("idlerow").style.display = (picked && picked.value === "idle_timeout") ? "flex" : "none";
+    $("idlehint").style.display = (picked && picked.value === "idle_timeout") ? "block" : "none";
+  };
+  box.querySelectorAll("input[name=micstream]").forEach(el => {
+    el.addEventListener("change", sync);
+  });
+  $("idlesecs").value = Math.round(c.idle_timeout_s != null ? c.idle_timeout_s : 7);
+  sync();
+}
+
 async function loadConfig() {
   const c = await api("/api/config");
   configCache = c;
   $("trad").checked = !!c.traditional;
   $("noperiod").checked = c.remove_trailing_period !== false;
   $("mode").value = c.mode || "auto";
+  renderMicStream(c);
 
   // 麥克風用名稱當主要識別（索引會隨藍牙重連改變）
   const sel = $("device");
@@ -302,22 +356,57 @@ async function loadConfig() {
   }).join("") || "<option>找不到音訊裝置</option>";
 }
 
+// 設定載入失敗要**明講**。
+// 為什麼：實測踩到 —— 設定頁的所有欄位都是「讀不到就留著預設 HTML」，
+// 所以後端掛掉時畫面看起來一切正常，但存下去的是空白表單的預設值。
+// 使用者看到的是「我的設定被吃掉了」，卻沒有任何線索。
+window.addEventListener("unhandledrejection", e => {
+  const msg = (e.reason && e.reason.message) || String(e.reason);
+  const box = document.querySelector('[data-page="settings"] .card:last-child .hint');
+  if (box) {
+    box.innerHTML = `<span style="color:var(--warn,#d9534f)">
+      ⚠️ 設定載入失敗：${esc(msg)}<br>
+      請重新整理頁面；在你看到正確的模式選項之前，<b>不要按「儲存設定」</b>，
+      否則會把預設值寫回設定檔。</span>`;
+  }
+});
+
 $("save").onclick = async () => {
   const sel = $("device");
   const opt = sel.options[sel.selectedIndex];
+  const picked = document.querySelector("input[name=micstream]:checked");
+
+  // ⚠️ 實測踩到：「找不到被選取的 radio 就送預設值」會**靜默吃掉使用者的設定**。
+  // 使用者手改 config.toml 成 session 之後，只要在這一頁按一次儲存、
+  // 而選項還沒渲染完成，就會被蓋回 per_press —— 他看到的現象是
+  // 「我改了都沒用」，而且完全沒有錯誤訊息。
+  // 所以：讀不到就不送，讓值留在檔案裡。
+  if (!picked) {
+    $("saved").textContent = "讀不到模式選項，請重新整理後再儲存";
+    $("saved").style.color = "var(--warn, #d9534f)";
+    setTimeout(() => { $("saved").textContent = ""; $("saved").style.color = "var(--ok)"; },
+               4000);
+    return;
+  }
+
+  const body = {
+    traditional: $("trad").checked,
+    remove_trailing_period: $("noperiod").checked,
+    mode: $("mode").value,
+    device_index: parseInt(sel.value, 10),
+    mic_name: opt ? (opt.dataset.name || "") : "",
+    mic_stream: picked.value,
+    idle_timeout_s: parseFloat($("idlesecs").value) || 7,
+  };
   try {
     await api("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        traditional: $("trad").checked,
-        remove_trailing_period: $("noperiod").checked,
-        mode: $("mode").value,
-        device_index: parseInt(sel.value, 10),
-        mic_name: opt ? (opt.dataset.name || "") : "",
-      }),
+      body: JSON.stringify(body),
     });
     $("saved").textContent = "已儲存 ✓";
+    // 存完重新讀一次，讓畫面（含狀態頁那一行）反映真正生效的值
+    setTimeout(() => { loadConfig().catch(() => {}); }, 300);
   } catch (e) {
     $("saved").textContent = "儲存失敗";
     alert("儲存失敗：" + e.message);

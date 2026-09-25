@@ -105,6 +105,12 @@ class Status:
                 "engine": self.engine_name,
                 "model": self.model_name,
                 "error": self.error,
+                "mic_stream": self.cfg.mic_stream,
+                # 串流現在到底有沒有開著 —— 使用者唯一能自行確認
+                # 「session 模式有沒有真的常駐」的方法（實測踩到：改了設定
+                # 卻因為路徑不同而沒生效，白白誤判一整輪）。
+                "mic_open": bool(getattr(daemon, "_cap", None) is not None),
+                "mic_device": getattr(daemon, "_mic_device", None),
             }
         # UI 的欄位名稱
         s = d["stats"]
@@ -121,6 +127,9 @@ class Status:
             "vendor_warning": d["vendor_warning"],
             "mic_warning": d["mic_warning"],
             "bt_warning": d["bt_warning"],
+            "mic_stream": d["mic_stream"],
+            "mic_open": d["mic_open"],
+            "mic_device": d["mic_device"],
             "engine": d["engine"],
             "model": d["model"],
             "error": d["error"],
@@ -375,9 +384,26 @@ def make_handler(status: Status):
                       "remove_trailing_period"):
                 if k in patch:
                     setattr(cfg, k, patch[k])
+            # 麥克風串流模式：只接受已知值，避免設定檔被塞進無效字串後
+            # 悄悄退回某個模式（那會讓「為什麼沒效果」變成無解的謎）
+            if "mic_stream" in patch:
+                val = str(patch["mic_stream"])
+                if val in config_module.MIC_STREAM_VALUES:
+                    cfg.mic_stream = val
+                else:
+                    return self._json(
+                        {"error": f"mic_stream 只能是 "
+                                  f"{'、'.join(config_module.MIC_STREAM_VALUES)}"}, 400)
+            if "idle_timeout_s" in patch:
+                try:
+                    secs = float(patch["idle_timeout_s"])
+                except (TypeError, ValueError):
+                    return self._json({"error": "idle_timeout_s 必須是數字"}, 400)
+                cfg.idle_timeout_s = max(config_module.IDLE_TIMEOUT_MIN,
+                                         min(config_module.IDLE_TIMEOUT_MAX, secs))
             path = cfg.save()
             self._json({"ok": True, "saved": str(path),
-                        "note": "裝置、輸出入方式與句號設定都會立即生效，不必重啟"})
+                        "note": "裝置、輸出入方式、句號與麥克風串流模式都會立即生效，不必重啟"})
 
         # ---- 模型 ----
         def _body(self) -> dict:
@@ -544,6 +570,9 @@ def main(argv: list[str] | None = None) -> int:
         device_provider=lambda: resolve_device(cfg, quiet=True)[0],
         # 即時讀設定 → 改「繁體輸出／移除句號／注入方式」也不必重啟
         cfg_provider=lambda: cfg,
+        # 手改 config.toml 也偵測得到（見 PttDaemon._sync_config）
+        config_path=config_module.CONFIG_PATH,
+        config_loader=config_module.Config.load,
     )
     status.daemon = daemon
 

@@ -192,18 +192,23 @@ class SenseVoiceEngine(SpeechEngine):
     def _build(self):
         import sherpa_onnx  # type: ignore
         common = dict(
-            model=str(self._model_file()),
             tokens=str(self.model_dir / "tokens.txt"),
             num_threads=self.threads,
             debug=False,
         )
         if self.resolved_kind() == "paraformer":
-            # Paraformer 沒有 use_itn / language，特徵是 80 維 fbank
+            # ⚠️ 實測踩到：`from_paraformer()` 的第一個參數叫 **`paraformer`**，
+            # 不是 `model`（那是 `from_sense_voice()` 的名字）。
+            # 傳錯的結果是 TypeError：`got an unexpected keyword argument 'model'`
+            # —— 代表**任何 Paraformer 模型都載不起來**，而設定介面還列得出來。
+            # Paraformer 沒有 use_itn / language，特徵是 80 維 fbank。
             return sherpa_onnx.OfflineRecognizer.from_paraformer(
-                **common, sample_rate=16000, feature_dim=80,
+                paraformer=str(self._model_file()), **common,
+                sample_rate=16000, feature_dim=80,
                 decoding_method="greedy_search")
         return sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            **common, use_itn=self.use_itn, language="auto")
+            model=str(self._model_file()), **common,
+            use_itn=self.use_itn, language="auto")
 
     def _ensure_loaded(self) -> None:
         if self._rec is not None:
