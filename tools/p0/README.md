@@ -106,17 +106,50 @@ python tools/p0/keycode_logger.py --analyze artifacts/t3-keycodes.jsonl
 按鈕在哪個 collection？鍵碼是什麼？按下次數是否等於實際次數？
 
 
-### T4 — 裝置會不會自行打字（手動）
+### T4 — 誰在打字？（**P0 已改寫**）
 
-1. 開記事本
-2. 把游標放進記事本
-3. 按住裝置按鈕說一句話、放開
-4. **觀察記事本是否自己冒出文字**
+原本的問法是「裝置會不會自己打字」。P0 已確認真正的答案在
+[`../../docs/hardware.md`](../../docs/hardware.md) §8：
+**不是裝置，是原廠工具「閃電說」在打字，而且它會注入按鍵。**
+
+所以 T4 拆成兩件必測的事：
+
+#### T4a — 按鍵會不會漏進前景視窗（**架構關鍵**）
+
+1. 開記事本，隨便打幾個字，把游標放在中間
+2. 按裝置的 **Backspace** 按鈕一次
+3. 按 **Enter** 按鈕一次
+4. 按 **方向鍵** 一次
 
 | 結果 | 意義 |
 |---|---|
-| 沒有冒出任何文字 | ✅ 裝置只是 HID 鍵盤 + 麥克風，照原架構走 |
-| 冒出文字 | ❌ 裝置內建辨識 → 架構需改為透傳/監聽模式 |
+| 記事本的字被刪掉／換行／游標移動 | ❌ **按鍵會漏** → 熱鍵層**必須抑制按鍵**（見 `AGENTS.md` §8.2） |
+| 記事本完全不動 | ✅ 有東西已經吃掉按鍵（很可能是閃電說）→ 仍需確認關閉它之後的行為 |
+
+#### T4b — 原廠工具的角色（**決定性實驗**）
+
+先關閉原廠工具（含自動啟動）：
+
+```powershell
+Stop-Process -Name shandianshuo -Force
+Remove-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name '闪电说'
+```
+
+然後重跑 T3，每顆按鈕各按 3 次，比較鍵碼：
+
+| 結果 | 意義 | 對計畫的影響 |
+|---|---|---|
+| 鍵碼與 `hardware.md` §3.3 **相同** | 按鈕是**裝置原生 HID** | ✅ 原架構可行 |
+| 按鈕**完全沒反應** | 按鈕靠閃電說經 SPP 實作 | ❌ 「全域熱鍵」路線不成立，需自行實作裝置協議 |
+| 鍵碼**不同** | 閃電說有重綁定 | 以原生鍵碼為準，原廠綁定視為衝突來源 |
+
+**要復原自動啟動**（測試完請自行決定是否還原）：
+
+```powershell
+Set-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' `
+  -Name '闪电说' -Value "$env:LOCALAPPDATA\Shandianshuo\shandianshuo.exe --autostart"
+```
+
 
 ---
 
