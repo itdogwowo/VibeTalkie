@@ -164,6 +164,48 @@ Invoked with: ..., 16000, b'\xf0\xff\xef\xff...'
 → `ptt.py` 加入 `warmup_audio()`，啟動時輪詢到真的收到音訊才接受按鍵。
 詳見 [`../hardware.md`](../hardware.md) §2.1。
 
+### T7 打包：**實測結果（推翻先前的猜測）**
+
+先前的計畫文件寫「PyInstaller 三平台打包痛苦、常被防毒誤報」。
+**實測後發現這句話只對一半**，而且錯的那一半會誤導選棧決策。
+
+用真實核心（載入 sherpa-onnx + 模型 + 辨識）打包量測：
+
+| 方式 | 大小 | 啟動到出字 | 狀態 |
+|---|---|---|---|
+| 原始碼直跑（基準） | — | **916 ms** | ✅ |
+| PyInstaller **onedir** | **42.1 MB**（22 檔） | **939 ms** | ✅ **可用，免裝 Python** |
+| PyInstaller **onefile** | 17.0 MB | 無法量測 | ⚠️ 解壓 `VCRUNTIME140.dll` 被拒 |
+
+**結論一：Python 打包成獨立 exe 完全可行。**
+onedir 只比原始碼慢 **+23 ms**（939 vs 916），而且不需要使用者裝 Python。
+`_sherpa_onnx.cp314-win_amd64.pyd`（5.8 MB 原生模組）有正確進 bundle，
+在**沒有 `PYTHONPATH`** 的乾淨環境下可獨立執行。
+
+**結論二：真正的痛點只在 `--onefile`，不在 Python。**
+onefile 每次啟動都要把整個 bundle 解壓到暫存目錄 —— 這正是
+「首次啟動慢、暫存目錄權限／防毒干擾、被防毒誤判」的來源
+（自我解壓的行為模式跟惡意程式相同）。
+本次在沙箱環境中，該解壓步驟被拒絕：
+
+```
+[PYI-ERROR] Failed to extract VCRUNTIME140.dll: fopen: Permission denied
+```
+
+⚠️ **注意：這是本沙箱的檔案政策造成的，不代表一般 Windows 上必然失敗。**
+但「每次啟動解壓到暫存目錄」這個機制本身，就是 onefile 脆弱的原因。
+
+**結論三：在這個專案裡，runtime 大小根本不是重點。**
+
+| 項目 | 大小 |
+|---|---|
+| Python runtime（onedir） | 42.1 MB |
+| Rust/Tauri runtime（估計） | ~15 MB |
+| **ASR 模型（兩者都要附）** | **229.4 MB** |
+
+模型的 229 MB 讓 42 MB vs 15 MB 的差距只佔總量的 **約 8%**。
+**打包大小不構成選棧理由。**
+
 ### 停止方式改為手動（依原廠流程）
 
 
