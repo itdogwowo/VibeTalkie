@@ -1,0 +1,20 @@
+# 跨平台換行正規化：repo 內一律用 LF，checkout 時由各平台決定。
+* text=auto eol=lf
+
+# Windows 專用腳本保留 CRLF，避免舊版 PowerShell 工具出問題
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二進位：不要碰
+*.wav binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.onnx binary
+*.bin binary
+*.gguf binary
+
+# 產出物不納入語言統計
+artifacts/** linguist-generated=true
