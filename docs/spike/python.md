@@ -224,34 +224,30 @@ onefile 每次啟動都要把整個 bundle 解壓到暫存目錄 —— 這正�
 
 ---
 
-## 使用的套件與版本
+## 使用的套件與版本（**實際使用的**）
 
-| 用途 | 套件 | 版本 |
+> 原始範本列的是「打算用什麼」（`sounddevice` / `pynput` / `pyperclip` / PySide6）。
+> 實作後**幾乎都沒用到** —— 下表才是真的。
+
+| 用途 | 實際做法 | 版本 |
 |---|---|---|
-| 錄音 | `sounddevice` | |
-| 重採樣 | `scipy` / `numpy` | |
-| VAD | `silero-vad` | |
-| ASR | `faster-whisper` 或 sherpa-onnx python | |
-| 熱鍵 | `pynput` | |
-| 注入／剪貼簿 | `pyperclip` + `pyautogui` | |
-| UI | PySide6 | |
+| 錄音 | `ctypes` + winmm **waveIn**（標準函式庫） | — |
+| 重採樣 | **不需要**（裝置直接給 16 kHz） | — |
+| VAD | **不需要**（改為手動按鍵停止，見下） | — |
+| ASR | **sherpa-onnx** + SenseVoice int8 | 1.13.8 |
+| 熱鍵 | `ctypes` **Raw Input**（自製，非 `pynput`） | — |
+| 注入／剪貼簿 | `ctypes` OpenClipboard / SendInput（非 `pyperclip`/`pyautogui`） | — |
+| 簡→繁 | `opencc-python-reimplemented` | 0.1.7 |
+| 頻譜分析 | `numpy` | 2.5.1 |
+| 打包 | PyInstaller（僅測試，見 T7） | 6.22.3 |
+| UI | 無（終端機） | — |
 
----
+**只有三個外部套件：sherpa-onnx、numpy、opencc。**
+其餘全部是 Python 標準函式庫 + Win32 API。
 
-## T1–T7 結果
-
-| 編號 | 測試 | 通過門檻 | 結果 | 證據／備註 |
-|---|---|---|---|---|
-| T1 | 裝置列舉 | 能看到藍牙麥克風 | ⬜ | |
-| T2 | 指定裝置錄音 | 5s 16k mono WAV，回放正確 | ⬜ | native rate: ___ |
-| T3 | 全域熱鍵 | 三平台事件正確 | ⬜ | 鍵碼: ___ |
-| T4 | ASR 準確率 | 中文 ≥ 95% | ⬜ | 實測 ___% |
-| T5 | ASR 延遲 | ≤ 1.5 s | ⬜ | 實測 ___ ms |
-| T6 | 文字注入 | 記事本 100% | ⬜ | |
-| T7 | 打包安裝 | 三平台可安裝啟動 | ⬜ | |
-| 附加 | 資源 | 啟動 ≤ 2s、閒置 ≤ 300 MB | ⬜ | |
-
----
+這件事有兩個實際好處：
+1. 相依極少 → 打包單純，沒有版本衝突。
+2. 本機 `pip` 是壞的（見下），但因為只需要三個套件，繞過 pip 的成本很低。
 
 ## 評分（1–5）
 
