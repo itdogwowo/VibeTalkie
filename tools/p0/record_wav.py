@@ -506,7 +506,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_probe(args.device, args.channels, args.bits)
 
     out = Path(args.out) if args.out else Path(
-        f"artifacts/t2-dev{args.device}-{args.rate}hz.wav")
+        f"artifacts/t2-dev{args.device}-{args.rate}hz-{time.strftime('%Y%m%d-%H%M%S')}.wav")
+    if out.exists():
+        print(f"⚠️ 目標檔已存在，將被覆蓋：{out}")
+        print("   （提示：不指定 --out 時，預設檔名含時間戳，不會互相覆蓋。）")
     return record(args.device, args.seconds, args.rate, args.channels, args.bits, out)
 
 
