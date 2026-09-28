@@ -110,6 +110,16 @@ function render(s) {
     `按 ${s.presses} · 成功 ${s.inserted} · 空 ${s.empty} · 失敗 ${s.failed}`;
   $("m-engine").textContent = s.engine || "—";
   $("m-active").textContent = s.model || "—";
+  // 切換模型後最想知道的就是「有沒有生效」——直接顯示，不要讓使用者自己比對
+  const mm = $("m-mismatch-row");
+  if (mm) {
+    if (s.model_mismatch) {
+      mm.style.display = "flex";
+      $("m-mismatch").textContent = `設定要 ${s.model_wanted}，實際跑 ${s.model_loaded}`;
+    } else {
+      mm.style.display = "none";
+    }
+  }
   $("a-engine").textContent = s.engine || "—";
   $("a-path").textContent = s.models_dir || "—";
   $("a-config").textContent = s.config_path || "—";
@@ -352,6 +362,71 @@ function renderMicStream(c) {
   sync();
 }
 
+// 麥克風優先順序：主 → 副，可上移／下移／移除。
+// 為什麼是清單而不是單選：藍牙麥克風會休眠、會斷線。有順序就能
+// 「主的不在就用副的、主的一回來就自動換回」，不必手動切。
+let micOrder = [];
+
+function renderMicOrder() {
+  const box = $("micorder");
+  if (!box) return;
+  if (!micOrder.length) {
+    box.innerHTML = `<div class="hint" style="margin:0">
+      還沒有指定麥克風 —— 按下面的「加入」選一支（第一支就是主麥克風）。</div>`;
+    return;
+  }
+  box.innerHTML = micOrder.map((m, i) => `
+    <div class="modeopt on" style="display:flex;align-items:center;gap:8px;padding:8px 10px">
+      <span class="tag ${i === 0 ? "on" : ""}" style="flex:0 0 auto">${i === 0 ? "主" : "副 " + i}</span>
+      <span style="flex:1;word-break:break-all">${esc(m)}</span>
+      <button class="ghost sm" data-micup="${i}" ${i === 0 ? "disabled" : ""}>↑</button>
+      <button class="ghost sm" data-micdown="${i}" ${i === micOrder.length - 1 ? "disabled" : ""}>↓</button>
+      <button class="ghost sm" data-micdel="${i}">✕</button>
+    </div>`).join("");
+
+  box.querySelectorAll("[data-micup]").forEach(b => b.onclick = () => {
+    const i = +b.dataset.micup;
+    [micOrder[i - 1], micOrder[i]] = [micOrder[i], micOrder[i - 1]];
+    renderMicOrder();
+  });
+  box.querySelectorAll("[data-micdown]").forEach(b => b.onclick = () => {
+    const i = +b.dataset.micdown;
+    [micOrder[i + 1], micOrder[i]] = [micOrder[i], micOrder[i + 1]];
+    renderMicOrder();
+  });
+  box.querySelectorAll("[data-micdel]").forEach(b => b.onclick = () => {
+    micOrder.splice(+b.dataset.micdel, 1);
+    renderMicOrder();
+  });
+}
+
+function renderTriggerMode(c) {
+  const box = $("triggermode");
+  if (!box) return;
+  const opts = c.trigger_modes || [];
+  const cur = c.trigger_mode || "hold";
+  box.innerHTML = opts.map(o => `
+    <label class="modeopt${o.value === cur ? " on" : ""}">
+      <input type="radio" name="triggermode" value="${esc(o.value)}"${o.value === cur ? " checked" : ""}>
+      <span class="t">${esc(o.label)}</span>
+      <div class="n">${esc(o.note)}</div>
+    </label>`).join("");
+  const sync = () => {
+    const picked = box.querySelector("input[name=triggermode]:checked");
+    box.querySelectorAll(".modeopt").forEach(el => {
+      el.classList.toggle("on", el.querySelector("input").checked);
+    });
+    const row = $("dblrow");
+    if (row) row.style.display = (picked && picked.value === "double") ? "block" : "none";
+  };
+  box.querySelectorAll("input[name=triggermode]").forEach(el => {
+    el.addEventListener("change", sync);
+  });
+  const ms = $("dblms");
+  if (ms) ms.value = c.double_tap_ms != null ? c.double_tap_ms : 400;
+  sync();
+}
+
 async function loadConfig() {
   const c = await api("/api/config");
   configCache = c;
@@ -359,15 +434,36 @@ async function loadConfig() {
   $("noperiod").checked = c.remove_trailing_period !== false;
   $("mode").value = c.mode || "auto";
   renderMicStream(c);
+  renderTriggerMode(c);
 
-  // 麥克風用名稱當主要識別（索引會隨藍牙重連改變）
-  const sel = $("device");
-  const want = c.mic_name || "";
-  sel.innerHTML = (c.devices || []).map(d => {
-    const on = (want && d.name === want) || (!want && d.index === c.device_index);
-    return `<option value="${d.index}" data-name="${esc(d.name)}"` +
-           `${on ? " selected" : ""}>${esc(d.name)}</option>`;
-  }).join("") || "<option>找不到音訊裝置</option>";
+  // 錄音鍵：填入目前值與候選清單
+  const hk = $("hotkey");
+  if (hk) hk.value = c.hotkey || "RightCtrl";
+  const dl = $("hotkey-list");
+  if (dl) {
+    dl.innerHTML = (c.hotkey_presets || []).map(k => `<option value="${esc(k)}"></option>`).join("");
+  }
+
+  // 麥克風優先順序
+  micOrder = (c.mic_order && c.mic_order.length ? c.mic_order
+             : (c.mic_names && c.mic_names.length ? c.mic_names
+                : (c.mic_name ? [c.mic_name] : []))).slice();
+  renderMicOrder();
+  const add = $("micadd");
+  if (add) {
+    add.innerHTML = (c.devices || []).map(d => `<option>${esc(d.name)}</option>`).join("")
+      || "<option>找不到音訊裝置</option>";
+  }
+  const addBtn = $("micadd-btn");
+  if (addBtn) {
+    addBtn.onclick = () => {
+      const name = ($("micadd").value || "").trim();
+      if (!name) return;
+      if (micOrder.includes(name)) return;      // 不重複加同一支
+      micOrder.push(name);
+      renderMicOrder();
+    };
+  }
 }
 
 // 設定載入失敗要**明講**。
@@ -386,9 +482,8 @@ window.addEventListener("unhandledrejection", e => {
 });
 
 $("save").onclick = async () => {
-  const sel = $("device");
-  const opt = sel.options[sel.selectedIndex];
   const picked = document.querySelector("input[name=micstream]:checked");
+  const trigPick = document.querySelector("input[name=triggermode]:checked");
 
   // ⚠️ 實測踩到：「找不到被選取的 radio 就送預設值」會**靜默吃掉使用者的設定**。
   // 使用者手改 config.toml 成 session 之後，只要在這一頁按一次儲存、
@@ -407,8 +502,11 @@ $("save").onclick = async () => {
     traditional: $("trad").checked,
     remove_trailing_period: $("noperiod").checked,
     mode: $("mode").value,
-    device_index: parseInt(sel.value, 10),
-    mic_name: opt ? (opt.dataset.name || "") : "",
+    // 麥克風優先順序（第一個是主）。名稱優先，索引會隨藍牙重連改變。
+    mic_names: micOrder.slice(),
+    hotkey: ($("hotkey").value || "").trim(),
+    trigger_mode: trigPick ? trigPick.value : "hold",
+    double_tap_ms: parseInt($("dblms").value, 10) || 400,
     mic_stream: picked.value,
     idle_timeout_s: parseFloat($("idlesecs").value) || 7,
   };
@@ -422,10 +520,13 @@ $("save").onclick = async () => {
     // 存完重新讀一次，讓畫面（含狀態頁那一行）反映真正生效的值
     setTimeout(() => { loadConfig().catch(() => {}); }, 300);
   } catch (e) {
+    // 後端會回具體原因（例如「錄音鍵無法解析」）——要讓使用者看到，
+    // 不要只說「儲存失敗」。
     $("saved").textContent = "儲存失敗";
+    $("saved").style.color = "var(--warn, #d9534f)";
     alert("儲存失敗：" + e.message);
   }
-  setTimeout(() => { $("saved").textContent = ""; }, 2500);
+  setTimeout(() => { $("saved").textContent = ""; $("saved").style.color = "var(--ok)"; }, 3000);
 };
 
 // ---------------------------------------------------------------- 啟動

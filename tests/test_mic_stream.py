@@ -56,8 +56,11 @@ class FakeCapture:
         self.device_id = device_id
         self.rate = rate
         self.max_seconds = max_seconds
+        # 與真實 Capture 一致：一個固定大小的緩衝區（見 test_buffer_recycle）
+        self.max_bytes = int(rate * channels * bits // 8 * max_seconds)
         self.opened = False
         self.closed = False
+        self.recycles = 0
         self.data = bytearray()
         FakeCapture.instances.append(self)
 
@@ -75,6 +78,16 @@ class FakeCapture:
     @property
     def done(self) -> bool:
         return False
+
+    @property
+    def full(self) -> bool:
+        return len(self.data) >= self.max_bytes
+
+    def recycle(self) -> bool:
+        """模擬真實行為：歸零緩衝區並繼續錄。"""
+        self.recycles += 1
+        self.data.clear()
+        return True
 
     # -- 測試用 --
     def feed(self, n_bytes: int) -> None:
@@ -440,11 +453,11 @@ def test_device_reclaim_on_wake() -> None:
     check("離線時不關掉目前（退路的）串流", not cap.closed)
     check("有記下「目標離線」", d._target_seen_online is False)
 
-    print("\n  （2）目標回來時：要放掉退路串流，下次用對的裝置")
+    print("\n  （2）目標回來時：**不可**主動關掉串流（那是白白多一次中斷）")
     online["v"] = True
     d._tick_device()
-    check("回來時放掉退路串流", cap.closed or d._cap is None,
-          f"cap.closed={cap.closed} _cap={d._cap!r}")
+    check("回來時不主動關串流（第一次就是這樣寫錯的）", not cap.closed,
+          "若失敗：每次喚醒都會多斷一次")
     check("有記下「目標上線」", d._target_seen_online is True)
 
     print("\n  （3）錄音中就算目標回來，也不可切掉正在錄的音")
@@ -470,6 +483,128 @@ def test_device_reclaim_on_wake() -> None:
         check("沒探測函式時安全略過", False, f"{type(exc).__name__}: {exc}")
 
 
+def test_no_config_thrash() -> None:
+    """⚠️ 自己存的設定不可以被自己重讀覆蓋（會造成模型反覆重新載入）。
+
+    實際踩到的症狀（使用者 log）：
+
+        🔁 已切換模型：sense-voice-…-2025-09-09
+          · 已切換模型：paraformer-…
+          · 已切換模型：sense-voice-…-2025-09-09
+
+    迴圈是：「UI 儲存」改記憶體並寫檔案 → 主迴圈的 `_sync_config()` 看到
+    mtime 變了而從**磁碟**重讀 → 磁碟上的值與記憶體不同時把記憶體**蓋回去**
+    → `_tick_model()` 看到不一致就重新載入舊模型 → 使用者再存一次…
+
+    修法：應用程式自己存檔後呼叫 `config_saved()`，記下 mtime ——
+    下一輪 `_sync_config()` 看到同一個 mtime 就略過。
+    **真正的外部編輯（mtime 又變了）仍然要被抓到。**
+    """
+    print("\n[11] 自己存的設定不可被自己重讀覆蓋（模型反覆重載的根因）")
+    import os
+
+    from config import Config
+
+    tmp = ROOT / "artifacts" / "pytest-config-thrash.toml"
+    tmp.unlink(missing_ok=True)
+
+    cfg = Config()
+    cfg.model_dir = "model-A"
+    cfg.save(tmp)
+
+    d = ptt_mod.PttDaemon(
+        engine=None, device_index=0, dry_run=True,
+        cfg_provider=lambda: cfg, device_provider=lambda: 0,
+        config_path=tmp, config_loader=Config.load,
+    )
+    d._sync_config()
+    check("初始同步", cfg.model_dir == "model-A", cfg.model_dir)
+
+    # 模擬「UI 儲存」：改記憶體 → 寫檔 → 通知 daemon
+    cfg.model_dir = "model-B"
+    d.config_saved(cfg.save(tmp))
+
+    # 主迴圈接著跑 —— 這裡**不可以**把 model-B 蓋回 model-A
+    d._sync_config()
+    check("自己存的變更沒有被自己覆蓋掉", cfg.model_dir == "model-B", cfg.model_dir)
+    d._sync_config()
+    check("連續多次也不會漂移", cfg.model_dir == "model-B", cfg.model_dir)
+
+    # 真正的外部編輯仍要被偵測到
+    ext = Config.load(tmp)
+    ext.model_dir = "model-C"
+    ext.save(tmp)
+    st = tmp.stat()
+    os.utime(tmp, (st.st_atime, st.st_mtime + 5))
+    d._sync_config()
+    check("外部編輯仍會被套用（功能沒有被犧牲）",
+          cfg.model_dir == "model-C", cfg.model_dir)
+
+    tmp.unlink(missing_ok=True)
+
+
+def test_buffer_recycle() -> None:
+    """⚠️ 常駐串流的緩衝區必須週期性回收，否則擷取會停掉。
+
+    實際踩到的 bug（使用者說「藍牙錄音好像怪怪的，要切到 USB 才能用」）：
+
+    `Capture` 只掛**一個** `WAVEHDR`，長度是 `max_seconds`。填滿之後
+    `waveIn` 沒有 header 可寫 —— **就完全停止擷取**。一次性使用沒差，
+    但 `session` 常駐串流會一直開著：
+
+        串流開啟 → 約 max_s 秒後緩衝區滿 → 之後錄到的**全是空的**
+
+    實測證據（`tools/p1/diagnose_zero_audio.py`）：
+        修正前：第 1、2 次正常，第 3 次起每次都卡在 256000（＝上限）
+        修正後：6 次全部正常、0 bytes 次數 = 0
+
+    而且**串流看起來完全正常**（`mic_open=True`、沒有錯誤），只有音訊是空的。
+    """
+    print("\n[12] 常駐串流要回收緩衝區（否則擷取停掉、錄到空音訊）")
+    d = make_daemon("session")
+    FakeCapture.instances.clear()
+
+    d._start_recording("t")
+    cap = FakeCapture.instances[-1]
+    d._finish_recording()
+    limit = cap.max_bytes
+    check("FakeCapture 有模擬固定緩衝區", limit > 0, f"{limit} bytes")
+
+    print("\n  （1）累積不到一半：不該回收")
+    cap.data.clear()
+    cap.feed(int(limit * 0.3))
+    d._cap_seen = len(cap.recorded())
+    d._tick_buffer()
+    check("未達門檻不回收", cap.recycles == 0, f"recycles={cap.recycles}")
+
+    print("\n  （2）累積超過一半：要回收（而不是等它滿）")
+    cap.data.clear()
+    cap.feed(int(limit * 0.6))
+    d._cap_seen = len(cap.recorded())
+    d._tick_buffer()
+    check("達門檻要回收", cap.recycles == 1, f"recycles={cap.recycles}")
+    check("回收後 _cap_seen 歸零", d._cap_seen == 0, str(d._cap_seen))
+
+    print("\n  （3）錄音中不可回收（會丟掉正在錄的音）")
+    d._start_recording("t")
+    before = cap.recycles
+    cap.data.clear()
+    cap.feed(limit)                        # 滿了
+    d._cap_seen = len(cap.recorded())
+    d._set_state("RECORDING")
+    d._tick_buffer()
+    check("錄音中不回收", cap.recycles == before,
+          f"recycles {before} → {cap.recycles}")
+
+    print("\n  （4）回收失敗時要關掉重開（比拿到空音訊好）")
+    d._set_state("IDLE")
+    cap.recycle = lambda: False            # 模擬回收失敗
+    d._cap_seen = limit
+    d._tick_buffer()
+    check("回收失敗 → 關掉串流", cap.closed or d._cap is None,
+          f"closed={cap.closed} _cap={d._cap!r}")
+
+
 def main() -> int:
     print("=" * 70)
     print("麥克風串流模式測試")
@@ -486,6 +621,8 @@ def main() -> int:
     test_early_return_keeps_stream()
     test_session_never_closed_by_idle()
     test_device_reclaim_on_wake()
+    test_no_config_thrash()
+    test_buffer_recycle()
 
     print("\n" + "=" * 70)
     if failures:

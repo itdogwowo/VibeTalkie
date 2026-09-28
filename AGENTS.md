@@ -71,6 +71,7 @@ VibeTalkie/
 │  ├─ model_index.py      # 官方模型清單：抓取 → 分類 → 快取
 │  ├─ core/               # ★ 執行期模組（產品依賴，**不是工具**）
 │  │  ├─ speech_engine.py #   ASR 引擎（sherpa-onnx，多模型家族）
+│  │  ├─ hotkey.py        #   錄音鍵規格解析（RightCtrl / F9 / Ctrl+Alt+R）
 │  │  ├─ ptt.py           #   PTT 常駐：Raw Input → 錄音 → 辨識 → 注入
 │  │  ├─ recorder.py      #   擷取封裝（自動停止、音量分析）
 │  │  ├─ record_wav.py    #   winmm waveIn 底層
@@ -96,6 +97,7 @@ VibeTalkie/
 │     ├─ measure_ptt_modes.py           # §2.4.1b：用真實 ptt.py 驅動三模式並對齊時間軸
 │     ├─ measure_session_reuse.py       # session 模式是否真的重用串流（查「每段都斷」）
 │     ├─ watch_bt_events.py             # 被動監看藍牙端點（邊用 app 邊看，會印出當前模式）
+│     ├─ diagnose_zero_audio.py         # §7.1.11：連續錄音診斷（串流重用＋0 bytes）
 │     ├─ eval_yue_models.py             # §7.1：多模型粵語對照（速度＋逐句並排輸出）
 │     ├─ record_eval_set.py             # §7.1：錄自己的評測語料（計時自動換句）
 │     ├─ measure_audio_latency.py       # 產出 hardware.md §2.1 的數據
@@ -357,6 +359,9 @@ python tests/test_model_index.py --live    # 對真實 499 筆跑統計（需連
 python tests/test_models_api.py            # 模型下載／切換 API
 python tests/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
 python tests/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）
+python tests/test_mic_stream.py       # 串流模式、緩衝區回收、裝置復歸
+python tests/test_config_api.py       # /api/config 欄位契約與驗證
+python tests/test_trigger.py          # 錄音鍵解析＋三種觸發方式
 ```
 
 `test_status_contract.py` 會去讀 `app/ui/app.js`，檢查 UI 引用到的每個

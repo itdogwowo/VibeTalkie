@@ -136,6 +136,48 @@ class Capture:
         winmm.waveInClose(self.hwi)
         self._open = False
 
+    @property
+    def full(self) -> bool:
+        """緩衝區滿了沒（滿了就代表驅動程式已經停止擷取）。"""
+        return int(self.hdr.dwBytesRecorded) >= self.max_bytes
+
+    def recycle(self) -> bool:
+        """把緩衝區歸零並**重新開始擷取**，讓常駐串流可以一直開著。
+
+        ## 為什麼一定要有這個（實測踩到，症狀是「藍牙錄音壞掉」）
+
+        `Capture` 只掛了**一個** `WAVEHDR`，長度是 `max_seconds`。那個緩衝區
+        填滿之後，`waveIn` 沒有新的 header 可以寫 —— **就完全停止擷取**。
+
+        一次性使用時這不是問題（使用者早就關掉了）。但 `session` /
+        `idle_timeout` 模式會讓串流**一直開著**，於是：
+
+            串流開啟 → 8 秒後緩衝區滿 → 之後錄到的**全部是空的**
+
+        使用者的實測完全吻合：「前三次 0 bytes、後來才通」、「只有短句辨識得出來」。
+        更糟的是：**串流看起來完全正常**（`mic_open=True`、沒有錯誤），
+        只有音訊永遠是 0 bytes。
+
+        ## 為什麼在待命時回收是安全的
+
+        錄音的資料在放開時就已經被 `recorded()` 取走並切出來了，所以待命期間
+        緩衝區裡的內容**沒有人要**。丟掉它換取「串流繼續活著」是純賺。
+
+        ⚠️ **絕對不能在錄音中呼叫** —— 會丟掉正在錄的音。
+        呼叫端（`ptt.py`）已經用 `state == "IDLE"` 擋住。
+
+        回傳 True 表示有真的回收。
+        """
+        if not self._open:
+            return False
+        winmm.waveInReset(self.hwi)          # 停止並把所有緩衝區標記為完成
+        self.hdr.dwBytesRecorded = 0
+        self.hdr.dwFlags = 0
+        rc = winmm.waveInAddBuffer(self.hwi, ctypes.byref(self.hdr), ctypes.sizeof(WAVEHDR))
+        if rc != 0:
+            return False
+        return winmm.waveInStart(self.hwi) == 0
+
     def recorded(self) -> bytes:
         got = int(self.hdr.dwBytesRecorded)
         got -= got % self.fmt.nBlockAlign

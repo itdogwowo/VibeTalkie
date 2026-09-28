@@ -35,6 +35,7 @@ sys.path.insert(0, str(HERE / "core"))          # 執行期模組
 
 from config import Config  # noqa: E402
 import config as config_module  # noqa: E402
+import hotkey  # noqa: E402  # 錄音鍵規格解析（見 app/core/hotkey.py）
 import models  # noqa: E402
 import model_index  # noqa: E402
 from models import ModelManager  # noqa: E402
@@ -115,6 +116,17 @@ class Status:
                 # None = 還沒檢查過；使用者靠這個知道「現在錄的是哪一支」
                 "target_online": (getattr(daemon, "_target_seen_online", None)
                                   if daemon is not None else None),
+                # 麥克風優先順序與各自在不在線（主／副）
+                "mic_order": mic_order_status(self.cfg),
+                "hotkey": self.cfg.hotkey,
+                "hotkey_label": (getattr(daemon, "_hotkey_spec", None).label
+                                 if getattr(daemon, "_hotkey_spec", None) else ""),
+                "hotkey_error": getattr(daemon, "_hotkey_error", None) if daemon else None,
+                "trigger_mode": self.cfg.trigger_mode,
+                # 執行期事實：這個行程的 tick 各跑了幾次。
+                # 「程式碼明明是對的，執行起來卻沒效果」時，這是最快的分辨方法 ——
+                # 空字典就代表這個行程根本沒有在跑主迴圈（例如舊行程或啟動失敗）。
+                "ticks": dict(getattr(daemon, "_tick_counts", {}) or {}),
                 # 設定檔指定的模型 vs 引擎**實際載入**的模型。
                 # 為什麼要分開顯示：實測踩到「設定改了、模型沒換」——
                 # 使用者聽到舊模型的效果，卻以為是模型本身不好。
@@ -145,6 +157,12 @@ class Status:
             "mic_open": d["mic_open"],
             "mic_device": d["mic_device"],
             "target_online": d["target_online"],
+            "mic_order": d["mic_order"],
+            "hotkey": d["hotkey"],
+            "hotkey_label": d["hotkey_label"],
+            "hotkey_error": d["hotkey_error"],
+            "trigger_mode": d["trigger_mode"],
+            "ticks": d["ticks"],
             "model_wanted": d["model_wanted"],
             "model_loaded": d["model_loaded"],
             # 只要這兩個不一致，就是「設定還沒生效」——讓 UI 直接顯示，不必查
@@ -229,6 +247,67 @@ def target_mic_online(cfg: Config) -> bool:
     if any(d == name for d in devs):
         return True
     return any(d.lower().startswith(name.lower()[:20]) for d in devs)
+
+
+def _find_device(devs: list[dict], name: str) -> dict | None:
+    """在裝置清單裡找一個名稱相符的（全等優先，其次前 20 字開頭符合）。
+
+    前 20 字是為了容忍 `WAVEINCAPS` 的 31 字元上限 ——
+    `"Headset (AI_VOICE_MAX Hands-Fre"` 就是被截斷的名字。
+    """
+    want = (name or "").strip()
+    if not want:
+        return None
+    for d in devs:
+        if d["name"] == want:
+            return d
+    key = want.lower()[:20]
+    for d in devs:
+        if d["name"].lower().startswith(key):
+            return d
+    return None
+
+
+def resolve_mic_priority(cfg: Config) -> tuple[int, str, list[dict]]:
+    """依**優先順序**挑麥克風：第一個「目前在線」的勝出。
+
+    為什麼要順序而不是單一裝置：藍牙麥克風會省電休眠、也會斷線。
+    清單讓「主的不在就用副的，主的一回來就自動換回」變成自動的事。
+
+    回傳 `(index, name, devices)`；都找不到時退回 `cfg.device_index`。
+    """
+    try:
+        devs = [{"index": i, "name": n.strip()} for i, n, *_ in list_devices()]
+    except Exception:
+        return cfg.device_index, "", []
+
+    order = cfg.effective_mic_order()
+    if not order:
+        return cfg.device_index, "", devs
+    for name in order:
+        hit = _find_device(devs, name)
+        if hit:
+            return hit["index"], hit["name"], devs
+    # 全部不在線 → 退回快取索引（總比完全不能錄好）
+    return cfg.device_index, "", devs
+
+
+def mic_order_status(cfg: Config) -> list[dict]:
+    """給 UI／狀態頁用：優先順序裡每一支麥克風現在在不在線。"""
+    try:
+        devs = [{"index": i, "name": n.strip()} for i, n, *_ in list_devices()]
+    except Exception:
+        devs = []
+    out = []
+    for i, name in enumerate(cfg.effective_mic_order()):
+        hit = _find_device(devs, name)
+        out.append({
+            "name": name,
+            "role": "主" if i == 0 else f"副 {i}",
+            "online": hit is not None,
+            "index": hit["index"] if hit else None,
+        })
+    return out
 
 
 # ---------------------------------------------------------------- 環境檢查
@@ -427,6 +506,48 @@ def make_handler(status: Status):
                       "remove_trailing_period"):
                 if k in patch:
                     setattr(cfg, k, patch[k])
+
+            # 麥克風優先順序（第一個是主、其餘是副）。只留字串，去空白與重複。
+            if "mic_names" in patch:
+                raw = patch["mic_names"]
+                if not isinstance(raw, list):
+                    return self._json({"error": "mic_names 必須是陣列"}, 400)
+                seen, order = set(), []
+                for x in raw:
+                    name = str(x or "").strip()
+                    if name and name not in seen:
+                        seen.add(name)
+                        order.append(name)
+                cfg.mic_names = order
+                # 兼容舊欄位：主麥克風同步到 mic_name，讓舊程式與文件一致
+                cfg.mic_name = order[0] if order else ""
+
+            # 錄音鍵：**一定要能解析才存**。存進一個看不懂的字串，
+            # 使用者會以為設定生效了，實際上還在用上一個鍵 ——
+            # 這種「靜默退回」最難查。
+            if "hotkey" in patch:
+                spec_text = str(patch["hotkey"] or "").strip()
+                try:
+                    parsed = hotkey.parse(spec_text)
+                except hotkey.HotkeyError as exc:
+                    return self._json({"error": f"錄音鍵無法解析：{exc}"}, 400)
+                cfg.hotkey = spec_text
+                _ = parsed.label          # 供除錯用；解析成功才往下走
+
+            if "trigger_mode" in patch:
+                val = str(patch["trigger_mode"])
+                if val not in config_module.TRIGGER_MODES_VALUES:
+                    return self._json(
+                        {"error": f"trigger_mode 只能是 "
+                                  f"{'、'.join(config_module.TRIGGER_MODES_VALUES)}"}, 400)
+                cfg.trigger_mode = val
+            if "double_tap_ms" in patch:
+                try:
+                    ms = int(patch["double_tap_ms"])
+                except (TypeError, ValueError):
+                    return self._json({"error": "double_tap_ms 必須是整數"}, 400)
+                cfg.double_tap_ms = max(150, min(1000, ms))
+
             # 麥克風串流模式：只接受已知值，避免設定檔被塞進無效字串後
             # 悄悄退回某個模式（那會讓「為什麼沒效果」變成無解的謎）
             if "mic_stream" in patch:
@@ -445,6 +566,13 @@ def make_handler(status: Status):
                 cfg.idle_timeout_s = max(config_module.IDLE_TIMEOUT_MIN,
                                          min(config_module.IDLE_TIMEOUT_MAX, secs))
             path = cfg.save()
+            # 告訴 daemon「這是我們自己寫的」—— 否則 _sync_config() 會把它
+            # 當成外部修改而從磁碟重讀，造成設定反覆被覆蓋、模型反覆重新載入。
+            if status.daemon is not None:
+                try:
+                    status.daemon.config_saved(path)
+                except Exception:
+                    pass
             self._json({"ok": True, "saved": str(path),
                         "note": "裝置、輸出入方式、句號與麥克風串流模式都會立即生效，不必重啟"})
 
@@ -500,7 +628,13 @@ def make_handler(status: Status):
                                    "message": f"載入失敗：{exc}"}, 500)
 
             status.cfg.model_dir = name
-            status.cfg.save()
+            path = status.cfg.save()
+            # 同上：這是我們自己寫的，別讓 _sync_config() 再從磁碟覆蓋一次
+            if status.daemon is not None:
+                try:
+                    status.daemon.config_saved(path)
+                except Exception:
+                    pass
             status.model_name = name
             status.error = None
             print(f"🔁 已切換模型：{name}")
@@ -609,8 +743,9 @@ def main(argv: list[str] | None = None) -> int:
         debug=args.debug,
         on_state=status.on_state,
         on_result=status.on_result,
-        # 每次錄音都重新解析裝置 → 在設定介面換麥克風之後**不必重啟**
-        device_provider=lambda: resolve_device(cfg, quiet=True)[0],
+        # 每次錄音都重新解析裝置 → 在設定介面換麥克風之後**不必重啟**。
+        # 走優先順序：主麥克風不在就用副的，主的一回來就自動換回。
+        device_provider=lambda: resolve_mic_priority(cfg)[0],
         # 即時讀設定 → 改「繁體輸出／移除句號／注入方式」也不必重啟
         cfg_provider=lambda: cfg,
         # 手改 config.toml 也偵測得到（見 PttDaemon._sync_config）

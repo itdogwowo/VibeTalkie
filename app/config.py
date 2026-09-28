@@ -66,13 +66,57 @@ MIC_STREAM_VALUES = tuple(o["value"] for o in MIC_STREAM_OPTIONS)
 IDLE_TIMEOUT_MIN = 5.0
 IDLE_TIMEOUT_MAX = 120.0
 
+# 錄音鍵的觸發方式。
+#
+# 為什麼要做成選項：裝置原生是「按住說話」（hold），但使用者要能完全脫離硬體 ——
+# 用鍵盤時，`hold` 會跟「按住某個鍵做別的事」衝突，所以需要其他方式。
+TRIGGER_MODES: list[dict] = [
+    {
+        "value": "hold",
+        "label": "按住說話（預設）",
+        "note": "按住錄音、放開結束。裝置原生就是這種；用鍵盤時要挑一個"
+                "單獨按住不會輸入字元的鍵（例如 RightCtrl、F9）。",
+    },
+    {
+        "value": "toggle",
+        "label": "按一下開始／再按一下停止",
+        "note": "不必一直按著。適合講長句，或鍵盤上不好長時間按住的鍵。",
+    },
+    {
+        "value": "double",
+        "label": "雙擊（模仿 macOS）",
+        "note": f"快速連按兩下開始錄音，再連按兩下停止。"
+                f"與其他操作最不衝突 —— 單擊不會觸發。",
+    },
+]
+
+TRIGGER_MODES_VALUES = tuple(o["value"] for o in TRIGGER_MODES)
+
+# 給 UI 的常用按鍵（使用者也可以自己打字；實際解析由 hotkey.py 負責）。
+# ⚠️ 這裡的每一項都必須能被 hotkey.parse() 解析 —— 有測試釘住。
+HOTKEY_PRESETS: list[str] = [
+    "RightCtrl", "LeftCtrl", "F8", "F9", "F10", "ScrollLock", "Pause",
+    "Ctrl+Alt+R", "Ctrl+Shift+Space", "Alt+`",
+]
+
 
 @dataclass
 class Config:
     # [device]
     device_index: int = 1
-    mic_name: str = ""                  # 僅供顯示；藍牙重新配對後 index 可能變
-    hotkey: str = "RightCtrl"           # 裝置原生送出的鍵，不可亂改（見 hardware.md §3.3）
+    mic_name: str = ""                  # 舊欄位；保留相容，正式來源是 mic_names
+    # 麥克風**優先順序**（第一個是主、其餘是副）。
+    # 為什麼要清單而不是單一裝置：藍牙麥克風會省電休眠、也會斷線。
+    # 有順序清單就能「主的不在就用副的，主的一回來就自動換回」，
+    # 使用者不必手動切換。空清單時退回舊的 mic_name。
+    mic_names: list = field(default_factory=list)
+
+    # [trigger] 錄音鍵（可完全自訂，不必綁任何硬體）
+    hotkey: str = "RightCtrl"           # 例如 RightCtrl / F9 / Ctrl+Alt+R
+    # 觸發方式：hold＝按住說話、toggle＝按一下開始再按一下停、
+    #           double＝雙擊（模仿 macOS 的聽寫快捷鍵）
+    trigger_mode: str = "hold"
+    double_tap_ms: int = 400            # double 模式的兩下間隔上限
 
     # [asr]
     engine: str = "sherpa-onnx"
@@ -143,7 +187,8 @@ class Config:
         d = asdict(self)
         d.pop("extra", None)
         sections = {
-            "device": ("device_index", "mic_name", "hotkey"),
+            "device": ("device_index", "mic_name", "mic_names", "hotkey",
+                       "trigger_mode", "double_tap_ms"),
             "asr": ("engine", "model_dir", "language", "threads"),
             "output": ("mode", "traditional", "restore_clipboard",
                        "remove_trailing_period"),
@@ -168,6 +213,13 @@ class Config:
         return {
             "device_index": self.device_index,
             "mic_name": self.mic_name,
+            "mic_names": list(self.mic_names or []),
+            "mic_order": self.effective_mic_order(),
+            "hotkey": self.hotkey,
+            "trigger_mode": self.trigger_mode,
+            "double_tap_ms": self.double_tap_ms,
+            "trigger_modes": TRIGGER_MODES,
+            "hotkey_presets": HOTKEY_PRESETS,
             "mode": self.mode,
             "traditional": self.traditional,
             "remove_trailing_period": self.remove_trailing_period,
@@ -178,12 +230,30 @@ class Config:
             "mic_stream_options": MIC_STREAM_OPTIONS,
         }
 
+    def effective_mic_order(self) -> list:
+        """實際要用的麥克風優先順序。
+
+        新舊欄位並存的關係：`mic_names` 是正式來源；若它是空的
+        （舊設定檔、或使用者還沒動過），就退回單一的 `mic_name`。
+        這樣舊設定不必遷移也不會壞掉。
+        """
+        names = [n for n in (self.mic_names or []) if n and n.strip()]
+        if names:
+            return names
+        return [self.mic_name] if (self.mic_name or "").strip() else []
+
 
 def _toml_value(v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
         return str(v)
+    if isinstance(v, (list, tuple)):
+        # ⚠️ 實測踩到：沒有這個分支時，清單會被 str() 成 `"[]"` ——
+        # 寫進 TOML 變成**字串**而不是陣列，讀回來就不是 list 了。
+        # `tomllib` 讀到 `mic_names = "[]"` 會給字串，於是
+        # `[n for n in "[]"]` 之類的程式碼就會拿到一堆 `[`、`]` 字元。
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
     s = str(v).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{s}"'
 

@@ -37,8 +37,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[2] / "third_party"))
 
 # 重用 P0 已經驗證過的 Raw Input 管線（結構定義、註冊、解析）
+import hotkey  # noqa: E402
 from keycode_logger import (  # noqa: E402
-    RAWHID,
     RAWKEYBOARD,
     RAWINPUTDEVICE,
     RAWINPUTHEADER,
@@ -77,6 +77,31 @@ VK_CONTROL = 0x11
 RI_KEY_E0 = 0x02          # 右側修飾鍵（Right Ctrl 的判別依據）
 
 
+# 同一家族但 VK 不同的鍵要視為相等。
+#
+# 為什麼需要：**兩種來源用的 VK 不一樣。** 實測（docs/hardware.md §3.3）：
+#   · Raw Input 回報**通用** VK_CONTROL（0x11），靠 E0 旗標分左右
+#   · Low-Level Hook 回報**專用** VK_RCONTROL（0xA3）
+# 設定檔寫 `RightCtrl` 時，解析出來是 0x11；但事件可能帶 0xA3。
+# 不做這層對應，單獨一顆 RightCtrl 就永遠觸發不了（實際踩到）。
+_VK_FAMILIES: tuple[frozenset[int], ...] = (
+    frozenset({0x10, 0xA0, 0xA1}),          # Shift / LShift / RShift
+    frozenset({0x11, 0xA2, 0xA3}),          # Ctrl / LCtrl / RCtrl
+    frozenset({0x12, 0xA4, 0xA5}),          # Alt / LAlt / RAlt
+    frozenset({0x5B, 0x5C}),                # LWin / RWin
+)
+
+
+def _vk_matches(a: int, b: int) -> bool:
+    """兩個 VK 是不是同一顆鍵（含左右通用／專用的對應）。"""
+    if a == b:
+        return True
+    for fam in _VK_FAMILIES:
+        if a in fam and b in fam:
+            return True
+    return False
+
+
 class PttDaemon:
     """按住錄音鍵說話，放開後把文字注入前景視窗。"""
 
@@ -97,6 +122,18 @@ class PttDaemon:
         self.device_filter = device_filter.lower() if device_filter else None
         self.key_vk = key_vk
         self.require_e0 = require_e0
+        # 可自訂的錄音鍵（由設定檔決定；見 app/core/hotkey.py）。
+        # `key_vk` / `require_e0` 保留給純終端機模式，沒有 cfg_provider 時才用。
+        self._hotkey_spec = None
+        self._hotkey_raw: str | None = None
+        self._hotkey_error: str | None = None
+        # 目前按住的修飾鍵（自己維護 —— Raw Input 只給單一事件，
+        # 不給「現在 Ctrl 有沒有按住」）
+        self._mods_down: set[str] = set()
+        # 觸發狀態機（hold / toggle / double）
+        self._capturing = False
+        self._last_tap_at = 0.0
+        self._double_window = 0.4           # 秒；double 模式的兩下間隔上限
         self.traditional = traditional
         self.remove_period = remove_period
         self.mode = mode
@@ -116,6 +153,11 @@ class PttDaemon:
         self.target_online_probe = target_online_probe
         self._target_seen_online: bool | None = None
         self._device_checked_at = 0.0
+        # 執行期事實（給診斷用）——回答「這個行程到底有沒有在跑 tick」。
+        # 實際踩到：狀態頁顯示 target_online=None，但程式碼明明是對的，
+        # 查不出是「程式碼沒被執行」還是「舊行程」。把自己數到的次數報出來，
+        # 一眼就能分辨。
+        self._tick_counts: dict[str, int] = {}
         self.debug = debug
         # 給 UI 用的回呼（可選）。不傳就只是純終端機模式。
         self.on_state = on_state
@@ -179,7 +221,10 @@ class PttDaemon:
                     "remove_period": self.remove_period,
                     "mode": self.mode,
                     "mic_stream": "per_press",
-                    "idle_timeout_s": 7.0}
+                    "idle_timeout_s": 7.0,
+                    "hotkey": "RightCtrl",
+                    "trigger_mode": "hold",
+                    "double_tap_ms": 400}
         if self.cfg_provider is None:
             return fallback
         try:
@@ -188,7 +233,10 @@ class PttDaemon:
                     "remove_period": bool(getattr(c, "remove_trailing_period", True)),
                     "mode": getattr(c, "mode", "auto") or "auto",
                     "mic_stream": getattr(c, "mic_stream", "per_press") or "per_press",
-                    "idle_timeout_s": float(getattr(c, "idle_timeout_s", 7.0) or 7.0)}
+                    "idle_timeout_s": float(getattr(c, "idle_timeout_s", 7.0) or 7.0),
+                    "hotkey": getattr(c, "hotkey", "RightCtrl") or "RightCtrl",
+                    "trigger_mode": getattr(c, "trigger_mode", "hold") or "hold",
+                    "double_tap_ms": int(getattr(c, "double_tap_ms", 400) or 400)}
         except Exception:
             return fallback
 
@@ -282,6 +330,46 @@ class PttDaemon:
             self._close_capture(f"閒置逾時 {timeout_s:g}s")
             self._idle_at = None
 
+    # 常駐串流的緩衝區回收門檻：累積到 `max_s` 的這個比例就回收。
+    # 為什麼不能等它「滿」才回收 —— 滿了之後 `waveIn` 已經沒有 header 可寫，
+    # **擷取就停了**，那時回收也救不回中間那段空窗。
+    _BUFFER_RECYCLE_AT = 0.5
+
+    def _tick_buffer(self) -> None:
+        """常駐串流的緩衝區累積到一半就回收（**這是藍牙錄音壞掉的根因**）。
+
+        `Capture` 只掛一個 `WAVEHDR`；填滿之後 `waveIn` 沒有 header 可寫，
+        **就完全停止擷取**。一次性使用沒差，但常駐串流會一直開著 ——
+        於是「串流開啟約 `max_s` 秒之後，錄到的全部是空的」。
+
+        實測症狀：連續錄音時前幾次拿到 `0 bytes`，之後偶爾正常；
+        短句還辨識得出來、長句全是垃圾。**而且串流看起來完全正常**
+        （`mic_open=True`、沒有任何錯誤），只有音訊永遠是空的。
+
+        ## 為什麼是「一半」而不是「滿了」
+
+        滿了＝擷取已經停止，那時才回收會在中間留下空窗。提早回收則完全不影響
+        任何一次錄音：每次按下時 `_cap_seen` 會重設，錄音資料在放開時就被取走，
+        所以待命期間的殘留沒有人要。
+
+        ⚠️ 只在 IDLE 時做 —— 錄音中回收會丟掉正在錄的音。
+        """
+        cap = self._cap
+        if cap is None or self.state != "IDLE":
+            return
+        limit = getattr(cap, "max_bytes", 0)
+        if not limit or self._cap_seen < limit * self._BUFFER_RECYCLE_AT:
+            return
+        try:
+            if cap.recycle():
+                self._cap_seen = 0
+                return
+        except Exception as exc:
+            if self.debug:
+                print(f"  · 緩衝區回收失敗：{exc}")
+        # 回收失敗 → 只能關掉重開（會多一次藍牙協商，但比拿到空音訊好）
+        self._close_capture("緩衝區回收失敗")
+
     def _sync_config(self) -> None:
         """偵測 `config.toml` 被改動就重新載入（讓手改檔案也能生效）。
 
@@ -334,6 +422,7 @@ class PttDaemon:
         # 於是誤判「換模型沒用」。**只要改了設定檔就是改了，全部都要同步。**
         for name in ("traditional", "remove_trailing_period", "mode",
                      "mic_stream", "idle_timeout_s", "device_index", "mic_name",
+                     "mic_names", "hotkey", "trigger_mode", "double_tap_ms",
                      "engine", "model_dir", "language", "threads"):
             if not hasattr(fresh, name):
                 continue
@@ -343,6 +432,37 @@ class PttDaemon:
                 changed.append(f"{name}={new}")
         if changed and self.debug:
             print(f"  · 設定檔已重新載入：{', '.join(changed)}")
+
+    def config_saved(self, path: Path | None = None) -> None:
+        """告訴 daemon「這個檔案是**我們自己**剛寫的，別當成外部修改」。
+
+        ## 為什麼需要這個（實測踩到，症狀是模型反覆重新載入）
+
+        「UI 儲存設定」與「偵測外部修改」原本會互相打架：
+
+          1. 使用者在 UI 選了新模型 → handler 改記憶體、`cfg.save()` 寫檔案
+          2. 主迴圈的 `_sync_config()` 看到 mtime 變了 → 從**磁碟**重讀
+          3. 若磁碟上的值與記憶體不同（例如檔案寫入與 POST 的競態，
+             或使用者其實沒按儲存），它會**把記憶體的值蓋回舊的**
+          4. `_tick_model()` 看到不一致 → 重新載入**舊模型**
+          5. 下一次 UI 儲存 → 回到步驟 1
+
+        結果是日誌出現模型反覆切換、每次都要重建引擎（數百毫秒），
+        而且使用者聽到的是「不知道現在跑哪個模型」。
+
+        ## 做法
+
+        應用程式自己存檔後呼叫這個方法，把 mtime 記下來 —— 下次
+        `_sync_config()` 看到同一個 mtime 就會直接略過，不會自己覆蓋自己。
+        **真正的外部編輯（mtime 又變了）仍然會被偵測到**，功能不受影響。
+        """
+        p = path or self.config_path
+        if p is None:
+            return
+        try:
+            self._cfg_mtime = Path(p).stat().st_mtime
+        except OSError:
+            pass
 
     def _tick_model(self) -> None:
         """設定檔換了模型就重新載入引擎（只在待命時做）。
@@ -426,13 +546,20 @@ class PttDaemon:
         was = self._target_seen_online
         self._target_seen_online = online
         if online and was is False:
-            # 目標麥克風回來了 —— 把退路的串流放掉，下次錄音就會用正確的裝置
+            # 目標麥克風回來了。
+            #
+            # ⚠️ **不要在這裡主動關掉串流。** 第一版就是那樣寫的，結果每次
+            #    「睡著 → 醒來」都主動多斷一次（關串流 → 藍牙重新協商）。
+            #    使用者的需求是「它上線時照我設定的順序就好」，不是「一醒來
+            #    就立刻換手」。
+            #
+            # 正確做法是把索引更新好，讓**下一次按下**自然用對的裝置：
+            # `_ensure_capture()` 會發現目前的串流不是目標裝置而換掉它 ——
+            # 那時機是使用者主動操作，中斷是合理的、也是預期的。
             if self.state == "IDLE":
-                if self._cap is not None:
-                    self._close_capture("目標麥克風重新上線")
                 self.device_index = self.current_device()
-                print(f"  · 目標麥克風已重新上線 → 下次錄音會用它"
-                      f"（device {self.device_index}）", flush=True)
+            print(f"  · 目標麥克風已重新上線 → 下次錄音會用它"
+                  f"（device {self.device_index}）", flush=True)
         elif not online and was is True:
             print("  · 目標麥克風離線（省電休眠？）—— 先沿用目前的裝置",
                   flush=True)
@@ -597,41 +724,165 @@ class PttDaemon:
         self._set_state("IDLE")
 
     # ------------------------------------------------ Raw Input
-    def _handle_key(self, hdevice, kb: RAWKEYBOARD) -> None:
-        if int(kb.VKey) != self.key_vk:
+    def _spec(self):
+        """目前生效的按鍵規格（跟著設定檔即時更新）。
+
+        為什麼不寫死：使用者要能完全脫離硬體 —— 用鍵盤、用別的鍵、
+        用組合鍵都要能動。解析失敗時**沿用上一個成功的規格**並記錄原因，
+        不會靜默退回預設值（那會讓使用者以為設定生效了）。
+        """
+        raw = self._live()["hotkey"]
+        if raw == self._hotkey_raw and self._hotkey_spec is not None:
+            return self._hotkey_spec
+        spec, err = hotkey.parse_or_default(raw)
+        self._hotkey_raw = raw
+        self._hotkey_spec = spec
+        if err and err != self._hotkey_error:
+            self._hotkey_error = err
+            print(f"  ⚠️ 錄音鍵設定無法解析（{err}）—— 暫時沿用 "
+                  f"{spec.label}", flush=True)
+        elif not err:
+            self._hotkey_error = None
+        return spec
+
+    def _spec_matches(self, vk: int, e0: bool) -> bool:
+        """這顆鍵是不是設定的主鍵？
+
+        ⚠️ **必須做「通用 ↔ 左右專用」的 VK 對應。** 這是實測踩到的 bug：
+
+            Raw Input 回報的是**通用** VK_CONTROL（0x11）＋ E0 旗標，
+            但 `hotkey.parse("RightCtrl")` 得到的是 vk=0x11（通用），
+            而 `hotkey.parse("LeftCtrl")` 得到 vk=0xA2（專用）。
+
+        兩種來源（Raw Input 與 Low-Level Hook）用的 VK 不一樣
+        （見 docs/hardware.md §3.3），所以比對時要把同一家族的鍵視為相等：
+        設定 `RightCtrl` → 通用 0x11 + E0 要中，專用 0xA3 也要中。
+        """
+        spec = self._spec()
+        if not _vk_matches(vk, spec.vk):
+            return False
+        # 右 Ctrl 的區分：裝置原生送的是 VK_CONTROL + E0 旗標
+        if spec.require_e0 and not e0:
+            return False
+        return True
+
+    def _mods_ok(self, main_vk: int | None = None) -> bool:
+        """設定的修飾鍵是否都按住了（不多也不少）。
+
+        `main_vk` 用來處理「主鍵本身就是修飾鍵」的情況（例如單獨一顆
+        RightCtrl 當錄音鍵）—— 那時它會出現在 `_mods_down` 裡，
+        但它不是「需要另外按住的修飾鍵」，所以要排除掉再比對。
+        """
+        spec = self._spec()
+        have = set(self._mods_down)
+        if main_vk is not None and main_vk in hotkey.MODIFIER_VKS:
+            have.discard(hotkey.MODIFIER_VKS[main_vk])
+        return have == set(spec.modifiers)
+
+    def _toggle_capture(self, label: str) -> None:
+        """toggle / double 模式的「開始 ↔ 停止」。"""
+        if self._capturing or self._cap is not None:
+            self._capturing = False
+            self._finish_recording()
+        else:
+            self._capturing = True
+            self.stats["presses"] += 1
+            self._start_recording(label)
+
+    def _on_main_down(self, label: str) -> None:
+        mode = self._live()["trigger_mode"]
+        if mode == "hold":
+            if not self._capturing:
+                self._capturing = True
+                self.stats["presses"] += 1
+                self._start_recording(label)
             return
-        target, label = self._is_target_device(hdevice)
+        if mode == "toggle":
+            self._toggle_capture(label)
+            return
+        # double：單擊不動作，等第二下（模仿 macOS 的聽寫手勢）
+        now = time.monotonic()
+        if (now - self._last_tap_at) <= self._double_window:
+            self._last_tap_at = 0.0            # 用掉這次配對
+            self._toggle_capture(label)
+        else:
+            self._last_tap_at = now
+
+    def _on_main_up(self) -> None:
+        """主鍵放開。
+
+        ⚠️ **只有 `hold` 模式該在這裡動作。** toggle / double 是「按下才算
+        一次」，若放開也處理，按一下就會「開始＋馬上停」——
+        實測被測試抓到（第一下按完 `_capturing` 又變回 False）。
+        """
+        if self._live()["trigger_mode"] == "hold" and self._capturing:
+            self._capturing = False
+            self._finish_recording()
+
+    def tick_trigger(self) -> None:
+        """double 模式的計時器：超過配對視窗就清掉「等待第二下」的狀態。
+
+        ⚠️ 必須由主迴圈定期呼叫。沒有它，double 模式會永遠配不到第二下。
+        """
+        if self._last_tap_at and (time.monotonic() - self._last_tap_at) > self._double_window:
+            self._last_tap_at = 0.0
+
+    def _handle_key(self, hdevice, kb: RAWKEYBOARD) -> None:
+        vk = int(kb.VKey)
         e0 = bool(int(kb.Flags) & RI_KEY_E0)
         down = kb.Message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+
+        # 修飾鍵狀態要**先**更新 —— 主鍵的判定會用到它。
+        # Raw Input 只送單一事件，不告訴我們「現在 Ctrl 有沒有按住」。
+        mod_name = hotkey.MODIFIER_VKS.get(vk)
+        if mod_name:
+            if down:
+                self._mods_down.add(mod_name)
+            else:
+                self._mods_down.discard(mod_name)
+
+        if not self._spec_matches(vk, e0):
+            return
+
+        spec = self._spec()
+        target, label = self._is_target_device(hdevice)
 
         # 被拒絕的時候要說得出原因，否則只能看到「按了沒反應」。
         # 實測踩過：送合成的 Ctrl 進來時 make=0、裝置無名、沒有 E0，
         # 結果整個事件被靜默丟棄，完全查不出為什麼。
-        if self.require_e0 and not e0:
+        if not self._mods_ok(vk):
             if self.debug:
-                print(f"  · 忽略非 E0 Ctrl（左 Ctrl／合成事件）flags=0x{int(kb.Flags):X} "
-                      f"make={int(kb.MakeCode)} dev={label}")
+                print(f"  · 忽略：修飾鍵不符（現在 {sorted(self._mods_down)}，"
+                      f"要 {sorted(spec.modifiers)}）")
             return
-        if not target:
+        # 裝置篩選只在「用裝置原生鍵」時才有意義。使用者若刻意把錄音鍵
+        # 改成別的鍵（完全脫離硬體），就不該再要求裝置符合 filter。
+        if not target and self.device_filter and not self._allow_any_device():
             if self.debug:
-                print(f"  · 忽略 {label} 的 Ctrl（不是目標裝置）")
+                print(f"  · 忽略 {label} 的 {spec.label}（不是目標裝置）")
             return
 
-        # 通過篩選的事件也要看得見 —— 否則「按了沒反應」時分不出是
-        # 「沒收到事件」還是「收到了但被邏輯吃掉」。
         if self.debug:
-            print(f"  · 接受 Ctrl {'DOWN' if down else 'UP  '} "
-                  f"flags=0x{int(kb.Flags):X} make={int(kb.MakeCode)} dev={label} "
-                  f"pressed={self._pressed}")
+            print(f"  · 接受 {spec.label} {'DOWN' if down else 'UP  '} "
+                  f"flags=0x{int(kb.Flags):X} dev={label} capturing={self._capturing}")
 
         with self._lock:
-            if down and not self._pressed:
-                self._pressed = True
-                self.stats["presses"] += 1
-                self._start_recording(label)
-            elif not down and self._pressed:
-                self._pressed = False
-                self._finish_recording()
+            if down:
+                self._on_main_down(label)
+            else:
+                self._on_main_up()
+
+    def _allow_any_device(self) -> bool:
+        """按鍵設定是否允許來自任何裝置。
+
+        判準：使用者把錄音鍵改成「不是裝置原生的那顆」時，就代表他想用
+        別的來源（鍵盤、滑鼠側鍵…）。這種情況不該再要求裝置符合
+        `device_filter` —— 否則「完全脫離硬體」做不到。
+
+        裝置原生鍵的定義：VK_CONTROL + 限定右側 + 沒有其他修飾鍵。
+        """
+        spec = self._spec()
+        return not (spec.vk == 0x11 and spec.require_e0 and not spec.modifiers)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         self._msg_count += 1
@@ -770,13 +1021,23 @@ class PttDaemon:
                 if deadline and time.monotonic() > deadline:
                     break
                 # 手改 config.toml 也要生效（不然設定會被「儲存設定」覆蓋掉）
+                self._tick_counts["sync"] = self._tick_counts.get("sync", 0) + 1
                 self._sync_config()
                 # 設定檔換了模型就在待命時換掉引擎（否則只會換一半）
+                self._tick_counts["model"] = self._tick_counts.get("model", 0) + 1
                 self._tick_model()
                 # 目標麥克風（藍牙）醒來就自動跟上
+                self._tick_counts["device"] = self._tick_counts.get("device", 0) + 1
                 self._tick_device()
                 # idle_timeout 模式：閒置夠久就把串流關掉，讓藍牙播放回來
+                self._tick_counts["idle"] = self._tick_counts.get("idle", 0) + 1
                 self._tick_idle(self._live()["idle_timeout_s"])
+                # 常駐串流的緩衝區累積到一半就回收（否則擷取會停掉）
+                self._tick_counts["buffer"] = self._tick_counts.get("buffer", 0) + 1
+                self._tick_buffer()
+                # double 觸發模式的配對計時器（沒有它會永遠配不到第二下）
+                self._tick_counts["trigger"] = self._tick_counts.get("trigger", 0) + 1
+                self.tick_trigger()
                 time.sleep(0.005)
         except KeyboardInterrupt:
             print("\n（使用者中斷）")

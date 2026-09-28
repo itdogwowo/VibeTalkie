@@ -88,6 +88,13 @@
         <span class="v kv" id="m-active">—</span></div>
       <div class="row"><span class="k">引擎</span>
         <span class="v kv" id="m-engine">—</span></div>
+      <div class="row" id="m-mismatch-row" style="display:none">
+        <span class="k" style="color:var(--warn,#d9534f)">設定未生效</span>
+        <span class="v" id="m-mismatch" style="color:var(--warn,#d9534f)">—</span></div>
+      <div class="hint" style="margin:0">
+        這一行顯示的是**引擎實際載入的模型**。切換後它應該立刻跟著變；<br>
+        若沒變（或上面出現紅字），代表切換沒有真正生效 —— 重新整理頁面再試一次。
+      </div>
     </div>
 
     <div class="card">
@@ -110,13 +117,46 @@
   <section class="page" data-page="settings">
     <div class="card">
       <h2>輸入</h2>
-      <div class="row"><span class="k">麥克風</span>
-        <select id="device"></select></div>
-      <div class="row"><span class="k">觸發鍵</span>
-        <span class="v kv">Right Ctrl（裝置原生，不可改）</span></div>
-      <div class="hint" style="margin-bottom:0">
-        麥克風以**名稱**記住，不是索引 —— 藍牙重連後索引會變，
-        只記索引會靜默地從錯的裝置錄音。
+      <div class="row"><span class="k">觸發鍵（按鍵來源）</span>
+        <span class="v kv">藍牙裝置的 HID 或任何鍵盤（見下方「錄音鍵」）</span></div>
+
+      <div class="row" style="align-items:flex-start;flex-direction:column;gap:8px">
+        <span class="k">麥克風優先順序（主 → 副）</span>
+        <div id="micorder" style="width:100%"></div>
+        <div style="display:flex;gap:8px;align-items:center;width:100%">
+          <select id="micadd" style="flex:1"></select>
+          <button class="ghost sm" id="micadd-btn">加入</button>
+        </div>
+      </div>
+      <div class="hint" style="margin:8px 0 0">
+        主麥克風不在線時（藍牙省電休眠、拔掉）會自動用下一順位，
+        它回來就自動換回 —— 不必手動切換。<br>
+        <b>「按鍵」與「麥克風」是分開的</b>：你可以按藍牙麥克風的鍵、聲音從 USB 進來。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>錄音鍵與觸發方式</h2>
+      <div class="row">
+        <span class="k">錄音鍵</span>
+        <input type="text" id="hotkey" list="hotkey-list" placeholder="例如 RightCtrl / F9 / Ctrl+Alt+R"
+               style="min-width:220px">
+        <datalist id="hotkey-list"></datalist>
+      </div>
+      <div class="hint" style="margin:4px 0 10px">
+        可以填任何鍵或組合鍵。填**不是裝置原生的鍵**（例如 F9）就完全脫離硬體 ——
+        用鍵盤也能錄音。<br>
+        語法：<span class="kv">Ctrl+Alt+R</span>、<span class="kv">F9</span>、
+        <span class="kv">Ctrl+Shift+Space</span>、<span class="kv">Alt+`</span>；
+        修飾鍵順序不拘，<span class="kv">ctrl-alt-r</span> 也認。
+      </div>
+      <div class="row" style="align-items:flex-start;flex-direction:column;gap:8px">
+        <span class="k">觸發方式</span>
+        <div id="triggermode" style="width:100%"></div>
+      </div>
+      <div class="hint" id="dblrow" style="display:none;margin:8px 0 0">
+        連按兩下的間隔上限
+        <input type="number" id="dblms" min="150" max="1000" step="50" style="width:80px"> ms
       </div>
     </div>
 
@@ -157,6 +197,10 @@
         ⚠️ 這個值**必須比你講話時的停頓長**，否則每次放開都會斷一次，
         就等同「每次按下才開」了。實測 2 秒太短（等於沒有效果），
         一般交談建議 <span class="kv">8–15 秒</span>；最短只接受 5 秒。
+      </div>
+      <div class="hint" style="margin:8px 0 10px">
+        💡 <b>麥克風改用 USB，就不會有這個問題。</b>
+        按鍵仍然來自藍牙裝置（見上面「輸入」）—— 兩者互不影響。
       </div>
       <details class="hint" style="margin:4px 0 12px">
         <summary style="cursor:pointer">實測結果（使用者聽感 + 端點監看）</summary>
