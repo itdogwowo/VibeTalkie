@@ -163,12 +163,16 @@ def test_session_reuse_and_slicing() -> None:
     check("第二句只拿到新增的 400 bytes（沒有摻到第一句）",
           len(pcm2) == 400, f"{len(pcm2)}")
 
-    # 閒置關閉
-    d._set_state("IDLE")
-    d._idle_at = time.monotonic() - 100
-    d._tick_idle(7.0)
-    check("逾時後關掉串流", cap.closed)
-    check("關掉後 daemon 不再握著它", d._cap is None)
+    # 閒置關閉（要用 idle_timeout 模式才會發生 —— session 模式不該被關）
+    d2 = make_daemon("idle_timeout")
+    FakeCapture.instances.clear()
+    d2._start_recording("t")
+    cap2 = FakeCapture.instances[-1]
+    d2._set_state("IDLE")
+    d2._idle_at = time.monotonic() - 100
+    d2._tick_idle(7.0)
+    check("idle_timeout 逾時後關掉串流", cap2.closed)
+    check("關掉後 daemon 不再握著它", d2._cap is None)
 
 
 def test_idle_timeout_does_not_close_too_early() -> None:
@@ -191,6 +195,44 @@ def test_idle_timeout_does_not_close_too_early() -> None:
     d._idle_at = time.monotonic() - 31
     d._tick_idle(30.0)
     check("逾時且 IDLE 才關", cap.closed)
+
+
+def test_session_never_closed_by_idle() -> None:
+    """⚠️ `session` 模式**不可以**被閒置計時器關掉。
+
+    實際踩到的 bug：`_tick_idle()` 沒有檢查模式，只檢查「有串流、是 IDLE、
+    過了多久」。於是 `session`（名叫「開著不關」）在放開 `idle_timeout_s`
+    秒之後照樣被關 —— 因為 `_finish_recording()` 在常駐模式下**也會**
+    設定 `_idle_at`。
+
+    症狀很誤導：`session` 看起來「有時生效、有時不生效」，因為它只在
+    「按下 → 放開 → 逾時內」這段時間才真的常駐。使用者早先測到的
+    「零中斷」是真的（他當時連續操作），**但一停下來交談就破功**。
+    """
+    print("\n[9] session 模式不可被閒置計時器關掉（實際踩到的 bug）")
+    d = make_daemon("session", idle_timeout_s=1.0)   # 逾時刻意設超短
+    FakeCapture.instances.clear()
+
+    d._start_recording("t")
+    cap = FakeCapture.instances[-1]
+    d._set_state("IDLE")
+    # 模擬「放開後閒置很久」——_finish_recording 在常駐模式會設 _idle_at
+    d._idle_at = time.monotonic() - 100
+
+    d._tick_idle(1.0)
+    check("session 模式下，閒置再久都不關串流", not cap.closed,
+          "若這裡失敗，就是 _tick_idle 沒檢查模式")
+    check("串流仍被握著", d._cap is cap)
+
+    # 對照組：同一組狀態在 idle_timeout 模式就**應該**被關
+    d2 = make_daemon("idle_timeout", idle_timeout_s=1.0)
+    FakeCapture.instances.clear()
+    d2._start_recording("t")
+    cap2 = FakeCapture.instances[-1]
+    d2._set_state("IDLE")
+    d2._idle_at = time.monotonic() - 100
+    d2._tick_idle(1.0)
+    check("對照：idle_timeout 模式逾時要關（避免修過頭）", cap2.closed)
 
 
 def test_close_is_idempotent() -> None:
@@ -316,6 +358,118 @@ def test_model_dir_syncs() -> None:
           not missing, f"漏掉：{sorted(missing)}" if missing else "無")
 
 
+def test_early_return_keeps_stream() -> None:
+    """⚠️ 常駐模式的關鍵陷阱：early return 不能讓串流「消失」。
+
+    實際踩到的 bug（上線後才被使用者發現，極難查）：
+    `_finish_recording()` 原本先把 `self._cap` 清成 None，而「保留串流」
+    的還原寫在**後面**。於是只要走到後面的 early return
+    ——「完全沒收到音訊」或「錄太短」——串流就再也沒被指定回來：
+
+      · session 模式從此永久失效（`mic_open` 一直是 False）
+      · `_idle_at` 也沒設定 → 連閒置逾時都不會去關它
+      · 而畫面與 UI 完全正常，只有「耳機怎麼又開始斷」這個症狀
+
+    觸發條件很普通：**一次沒收到音訊的按下就夠了。**
+
+    這個測試用「餵 0 音訊」重現那條路徑。
+    """
+    print("\n[8] early return 不可讓常駐串流消失（實際踩到的 bug）")
+    d = make_daemon("session")
+    FakeCapture.instances.clear()
+
+    # 第一次按下：正常錄到音訊
+    d._start_recording("第 1 次")
+    cap = FakeCapture.instances[-1]
+    cap.feed(2000)
+    d._finish_recording()
+    check("正常錄音後串流仍在", d._cap is cap, f"_cap={d._cap!r}")
+
+    # 第二次按下：**完全沒收到音訊**（藍牙 SCO 有時就是這樣）
+    d._start_recording("第 2 次")
+    same = FakeCapture.instances[-1]
+    check("第二次沿用同一個串流", same is cap)
+    # 不餵任何資料 → _cap_seen 之後是空的
+    same.data.clear()
+    d._finish_recording()
+    check("⚠️ 沒收到音訊之後，串流**仍然保留**（這裡是 bug 的位置）",
+          d._cap is not None, f"_cap={d._cap!r}")
+
+    # 第三次按下：錄太短
+    d._start_recording("第 3 次")
+    three = FakeCapture.instances[-1]
+    three.feed(320)                       # 0.01 秒 < min_s
+    d._finish_recording()
+    check("錄太短之後，串流仍然保留", d._cap is not None, f"_cap={d._cap!r}")
+
+    # 第四次按下：要能正常運作（串流沒有壞掉）
+    d._start_recording("第 4 次")
+    four = FakeCapture.instances[-1]
+    check("第四次要沿用同一個串流（沒有被重開）", four is cap,
+          f"共開了 {len(FakeCapture.instances)} 個串流")
+    check("全程只開過一個串流", len(FakeCapture.instances) == 1,
+          f"{len(FakeCapture.instances)} 個")
+
+
+def test_device_reclaim_on_wake() -> None:
+    """藍牙麥克風省電休眠後回來時，要**自動**跟上（不必等下一次按下）。
+
+    實際情境（使用者回報）：`AI_VOICE_MAX` 閒置太久會進省電休眠、從系統消失。
+    裝置離線期間 `resolve_device()` 會退回設定檔的 `device_index`（別支麥克風），
+    這是對的 —— 總比完全不能錄好。但先前的行為是**被動**的：
+    裝置回來後要等使用者**下一次按下**才重算，使用者只覺得
+    「它醒了，但程式還在用錯的麥克風」，而且沒有任何提示。
+    """
+    print("\n[10] 目標麥克風醒來要自動跟上")
+    online = {"v": True}
+    d = ptt_mod.PttDaemon(
+        engine=None, device_index=0, dry_run=True,
+        cfg_provider=lambda: Cfg("session"), device_provider=lambda: 0,
+        target_online_probe=lambda: online["v"],
+    )
+    # 讓節流不擋住測試
+    d._DEVICE_POLL_S = 0.0
+
+    print("\n  （1）目標離線時：不可亂關串流")
+    FakeCapture.instances.clear()
+    d._start_recording("t")
+    cap = FakeCapture.instances[-1]
+    d._set_state("IDLE")
+    online["v"] = False
+    d._tick_device()
+    check("離線時不關掉目前（退路的）串流", not cap.closed)
+    check("有記下「目標離線」", d._target_seen_online is False)
+
+    print("\n  （2）目標回來時：要放掉退路串流，下次用對的裝置")
+    online["v"] = True
+    d._tick_device()
+    check("回來時放掉退路串流", cap.closed or d._cap is None,
+          f"cap.closed={cap.closed} _cap={d._cap!r}")
+    check("有記下「目標上線」", d._target_seen_online is True)
+
+    print("\n  （3）錄音中就算目標回來，也不可切掉正在錄的音")
+    FakeCapture.instances.clear()
+    d2 = ptt_mod.PttDaemon(
+        engine=None, device_index=0, dry_run=True,
+        cfg_provider=lambda: Cfg("session"), device_provider=lambda: 0,
+        target_online_probe=lambda: True,
+    )
+    d2._DEVICE_POLL_S = 0.0
+    d2._target_seen_online = False        # 假裝目標之前是離線的
+    d2._start_recording("t")              # 狀態變成 RECORDING
+    cap2 = FakeCapture.instances[-1]
+    d2._tick_device()
+    check("錄音中不關串流", not cap2.closed, f"state={d2.state}")
+
+    print("\n  （4）沒有注入探測函式時不可爆掉（純終端機模式）")
+    d3 = make_daemon("session")
+    try:
+        d3._tick_device()
+        check("沒探測函式時安全略過", True)
+    except Exception as exc:
+        check("沒探測函式時安全略過", False, f"{type(exc).__name__}: {exc}")
+
+
 def main() -> int:
     print("=" * 70)
     print("麥克風串流模式測試")
@@ -329,6 +483,9 @@ def main() -> int:
     test_close_is_idempotent()
     test_config_file_reload()
     test_model_dir_syncs()
+    test_early_return_keeps_stream()
+    test_session_never_closed_by_idle()
+    test_device_reclaim_on_wake()
 
     print("\n" + "=" * 70)
     if failures:

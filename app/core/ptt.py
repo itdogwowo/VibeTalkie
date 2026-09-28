@@ -80,6 +80,10 @@ RI_KEY_E0 = 0x02          # 右側修飾鍵（Right Ctrl 的判別依據）
 class PttDaemon:
     """按住錄音鍵說話，放開後把文字注入前景視窗。"""
 
+    # 裝置列舉的節流間隔（秒）。`waveInGetDevCaps` 是逐台呼叫的，
+    # 沒必要每個迴圈（5ms）都問一次。
+    _DEVICE_POLL_S = 2.0
+
     def __init__(self, engine, device_filter: str | None = None,
                  key_vk: int = VK_CONTROL, require_e0: bool = True,
                  traditional: bool = True, mode: str = "auto",
@@ -87,7 +91,8 @@ class PttDaemon:
                  max_s: float = 60.0, device_index: int = 1, debug: bool = False,
                  on_state=None, on_result=None, device_provider=None,
                  remove_period: bool = True, cfg_provider=None,
-                 config_path: Path | None = None, config_loader=None):
+                 config_path: Path | None = None, config_loader=None,
+                 target_online_probe=None):
         self.engine = engine
         self.device_filter = device_filter.lower() if device_filter else None
         self.key_vk = key_vk
@@ -107,6 +112,10 @@ class PttDaemon:
         self.config_path = config_path
         self.config_loader = config_loader    # 由呼叫端注入，避免 ptt 直接依賴 config 模組
         self._cfg_mtime: float | None = None
+        # 「設定指定的麥克風現在在不在？」由呼叫端注入（見 _tick_device）
+        self.target_online_probe = target_online_probe
+        self._target_seen_online: bool | None = None
+        self._device_checked_at = 0.0
         self.debug = debug
         # 給 UI 用的回呼（可選）。不傳就只是純終端機模式。
         self.on_state = on_state
@@ -251,7 +260,20 @@ class PttDaemon:
         return cap
 
     def _tick_idle(self, timeout_s: float) -> None:
-        """idle_timeout 模式：放開後閒置超過 N 秒就關掉串流，讓聲音回來。"""
+        """`idle_timeout` 模式：放開後閒置超過 N 秒就關掉串流，讓聲音回來。
+
+        ⚠️ **必須先檢查模式。** 實測踩到的 bug：這個函式原本只檢查
+        「有沒有開串流、是不是 IDLE、過了多久」，**沒有檢查模式** ——
+        於是 `session` 模式（明明叫「開著不關」）放開 `idle_timeout_s`
+        秒之後也會被關掉。
+
+        症狀很誤導：`session` 看起來「有時候有生效、有時候沒有」，
+        因為它只在「按下 → 放開 → 5 秒內」這段時間才真的常駐。
+        使用者早先測到的「session 零中斷」是真的 —— 那時他連續操作，
+        每次都還沒超過閒置時間。**一次停止交談就會破功。**
+        """
+        if self._live()["mic_stream"] != "idle_timeout":
+            return
         if self._idle_at is None or self._cap is None:
             return
         if self.state != "IDLE":            # 錄音／辨識中都別關
@@ -363,6 +385,58 @@ class PttDaemon:
         except Exception as exc:
             print(f"  ⚠️ 切換模型失敗（沿用目前模型）：{exc}", flush=True)
 
+    def _tick_device(self) -> None:
+        """目標麥克風回來時，**自動**跟上（不必等下一次按下）。
+
+        ## 為什麼需要這個
+
+        藍牙麥克風閒置久了會進**省電休眠**、從系統消失（實測 `AI_VOICE_MAX`
+        會變 UNPLUGGED）。裝置離線期間，`resolve_device()` 會退回設定檔的
+        `device_index`（通常是別的麥克風）—— 這本身是對的，總比完全不能錄好。
+
+        但先前的行為是**被動**的：裝置回來之後，要等使用者**下一次按下**
+        才會重算索引並換回去。使用者感覺到的就是「它醒了，但程式還在用錯的
+        麥克風」，而且完全沒有提示。
+
+        ## 做什麼
+
+        每 `_DEVICE_POLL_S` 秒問一次「目標麥克風在不在」：
+
+          · 不在 → 記下來（`_target_seen_online=False`），什麼都不做，
+            讓現有的退路繼續運作
+          · 從不在變成在（**醒過來**）→ 關掉目前（退路的）串流，
+            下次錄音會用正確的裝置重開
+
+        ⚠️ 只在**待命**時動作：錄音或辨識中換裝置會切掉正在錄的音。
+        ⚠️ 裝置列舉不是免費的（`waveInGetDevCaps` 逐台呼叫），
+           所以有節流，不是每個迴圈都問。
+        """
+        if self.target_online_probe is None:
+            return
+        now = time.monotonic()
+        if now - self._device_checked_at < self._DEVICE_POLL_S:
+            return
+        self._device_checked_at = now
+
+        try:
+            online = bool(self.target_online_probe())
+        except Exception:
+            return
+
+        was = self._target_seen_online
+        self._target_seen_online = online
+        if online and was is False:
+            # 目標麥克風回來了 —— 把退路的串流放掉，下次錄音就會用正確的裝置
+            if self.state == "IDLE":
+                if self._cap is not None:
+                    self._close_capture("目標麥克風重新上線")
+                self.device_index = self.current_device()
+                print(f"  · 目標麥克風已重新上線 → 下次錄音會用它"
+                      f"（device {self.device_index}）", flush=True)
+        elif not online and was is True:
+            print("  · 目標麥克風離線（省電休眠？）—— 先沿用目前的裝置",
+                  flush=True)
+
     # ------------------------------------------------ 錄音 / 辨識 / 注入
     def _set_state(self, state: str) -> None:
         self.state = state
@@ -407,6 +481,14 @@ class PttDaemon:
         print(f"  🔴 錄音中…（{label}）", flush=True)
 
     def _finish_recording(self) -> None:
+        # ⚠️ 先把「常駐模式要保留串流」這件事做完，再處理任何 early return。
+        #
+        # 實際踩到的 bug（很難查）：原本 `self._cap` 在這裡就被清成 None，
+        # 而 `keep` 的還原寫在**後面**。於是只要走到後面的 early return
+        # —— 「完全沒收到音訊」或「錄太短」——串流就**再也沒被指定回來**，
+        # session 模式從此永久失效（`mic_open` 一直是 False、耳機恢復被斷），
+        # 而 `_idle_at` 也沒設定，所以連閒置逾時都不會去關它。
+        # 觸發條件很普通：一次沒收到音訊的按下就夠了。
         cap, self._cap = self._cap, None
         if cap is None:
             self._set_state("IDLE")
@@ -423,13 +505,13 @@ class PttDaemon:
                 pcm = cap.recorded()
         except Exception as exc:
             print(f"  ❌ 停止錄音失敗：{exc}")
-            self._close_capture("停止錄音失敗")
             self._set_state("IDLE")
             return
         if keep:
+            # 立刻放回去 —— 後面的任何 early return 都不能讓串流「消失」
             self._cap = cap
             self._cap_seen = len(cap.recorded())
-            self._idle_at = time.monotonic()  # 開始算閒置，逾時才關
+            self._idle_at = time.monotonic()
 
         n = len(pcm) // 2
         secs = n / 16000
@@ -691,6 +773,8 @@ class PttDaemon:
                 self._sync_config()
                 # 設定檔換了模型就在待命時換掉引擎（否則只會換一半）
                 self._tick_model()
+                # 目標麥克風（藍牙）醒來就自動跟上
+                self._tick_device()
                 # idle_timeout 模式：閒置夠久就把串流關掉，讓藍牙播放回來
                 self._tick_idle(self._live()["idle_timeout_s"])
                 time.sleep(0.005)

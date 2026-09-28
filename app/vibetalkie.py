@@ -111,6 +111,20 @@ class Status:
                 # 卻因為路徑不同而沒生效，白白誤判一整輪）。
                 "mic_open": bool(getattr(daemon, "_cap", None) is not None),
                 "mic_device": getattr(daemon, "_mic_device", None),
+                # 目標麥克風在不在？（藍牙省電休眠時會消失）
+                # None = 還沒檢查過；使用者靠這個知道「現在錄的是哪一支」
+                "target_online": (getattr(daemon, "_target_seen_online", None)
+                                  if daemon is not None else None),
+                # 設定檔指定的模型 vs 引擎**實際載入**的模型。
+                # 為什麼要分開顯示：實測踩到「設定改了、模型沒換」——
+                # 使用者聽到舊模型的效果，卻以為是模型本身不好。
+                # 這兩行只要不一致，就是「設定還沒生效」。
+                "model_wanted": self.cfg.model_dir,
+                # engine 可能還沒起來（啟動初期），那就報「設定指定的」而不是空白 ——
+                # 否則狀態頁會顯示「—」，看起來像壞掉
+                "model_loaded": (Path(self.engine.model_dir).name
+                                 if self.engine is not None
+                                 else self.cfg.model_dir),
             }
         # UI 的欄位名稱
         s = d["stats"]
@@ -130,6 +144,12 @@ class Status:
             "mic_stream": d["mic_stream"],
             "mic_open": d["mic_open"],
             "mic_device": d["mic_device"],
+            "target_online": d["target_online"],
+            "model_wanted": d["model_wanted"],
+            "model_loaded": d["model_loaded"],
+            # 只要這兩個不一致，就是「設定還沒生效」——讓 UI 直接顯示，不必查
+            "model_mismatch": bool(d["model_wanted"] and d["model_loaded"]
+                                   and d["model_wanted"] != d["model_loaded"]),
             "engine": d["engine"],
             "model": d["model"],
             "error": d["error"],
@@ -186,6 +206,29 @@ def resolve_device(cfg: Config, quiet: bool = False) -> tuple[int, str, list[dic
             return d["index"], d["name"], devs
 
     return cfg.device_index, "", devs
+
+
+def target_mic_online(cfg: Config) -> bool:
+    """設定指定的麥克風**現在**在不在裝置清單裡？
+
+    為什麼要單獨問這一個問題：藍牙麥克風閒置久了會進省電休眠、從系統消失
+    （實測：`AI_VOICE_MAX` 會變 UNPLUGGED）。使用者要的是
+    **「它回來的時候自動跟上」**，而不是每次都要自己處理。
+
+    所以 `ptt.py` 會定期問這個函式，一發現裝置回來了就換回去。
+    比對規則與 `resolve_device()` 一致（全等，或名稱前 20 字開頭符合 ——
+    WAVEINCAPS 名稱上限 31 字元，長名會被截斷）。
+    """
+    name = (cfg.mic_name or "").strip()
+    if not name:
+        return False
+    try:
+        devs = [n.strip() for _i, n, *_ in list_devices()]
+    except Exception:
+        return False
+    if any(d == name for d in devs):
+        return True
+    return any(d.lower().startswith(name.lower()[:20]) for d in devs)
 
 
 # ---------------------------------------------------------------- 環境檢查
@@ -573,6 +616,8 @@ def main(argv: list[str] | None = None) -> int:
         # 手改 config.toml 也偵測得到（見 PttDaemon._sync_config）
         config_path=config_module.CONFIG_PATH,
         config_loader=config_module.Config.load,
+        # 藍牙麥克風省電休眠後回來時，自動換回設定指定的那一支
+        target_online_probe=lambda: target_mic_online(cfg),
     )
     status.daemon = daemon
 

@@ -43,19 +43,24 @@
     <div class="bar"><i id="level"></i></div>
 
     <div class="card">
-      <h2>藍牙干擾模式（目前生效中）</h2>
+      <h2>目前生效中的設定</h2>
+      <div class="row"><span class="k">使用中的模型</span>
+        <span class="v" id="model-now">—</span></div>
       <div class="row"><span class="k">麥克風串流</span>
         <span class="v" id="micstream-now">—</span></div>
       <div class="row"><span class="k">串流現在開著嗎</span>
         <span class="v" id="mic-open">—</span></div>
+      <div class="row"><span class="k">設定的麥克風</span>
+        <span class="v" id="target-online">—</span></div>
       <div class="hint" style="margin:0">
         這裡顯示的是**程式現在真正在做的**，不是設定頁裡選的。<br>
-        · <span class="kv">session</span>：按過一次之後「開著」會**一直維持是**
-        （代表耳機那段時間聽不到聲音）<br>
-        · <span class="kv">idle_timeout</span>：放開後會維持「開著」，直到逾時才變「已關閉」，
-        那一刻耳機會恢復<br>
+        · <span class="kv">session</span>：按過一次之後「開著」會**一直維持是**<br>
+        · <span class="kv">idle_timeout</span>：放開後維持「開著」，直到逾時才變「已關閉」<br>
         · <span class="kv">per_press</span>：平時都是「已關閉」，只有錄音時是「開著」<br>
-        若這裡顯示的模式不是你要的，代表設定還沒生效 —— 回設定頁按「儲存設定」。
+        若模型顯示「（設定要 X，實際跑 Y）」，代表設定還沒生效 ——
+        回設定頁按「儲存設定」，或重啟程式。<br>
+        「設定的麥克風」若顯示**離線**，代表它進省電休眠了（藍牙閒置常見）——
+        程式會先沿用其他麥克風，等它醒來會**自動切回**，不必手動處理。
       </div>
     </div>
 

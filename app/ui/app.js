@@ -83,14 +83,28 @@ function render(s) {
   $("statemeta").textContent = s.error || meta;
   setDot(s.state);
 
-  // 目前實際生效的麥克風串流模式。
-  // 為什麼要顯示：使用者改了設定卻聽到一樣的結果時，這一行是唯一能分辨
-  // 「設定沒生效」與「生效了但效果不如預期」的線索。
+  // 目前實際生效的設定。
+  // 為什麼要顯示「設定要 X / 實際跑 Y」：實測踩過「設定改了、模型沒換」——
+  // 使用者聽到的是舊模型的效果，卻以為是模型本身不好，白白誤判一整輪。
+  const want = s.model_wanted || "", got = s.model_loaded || "";
+  $("model-now").textContent = s.model_mismatch
+    ? `（設定要 ${want}，實際跑 ${got}）`
+    : (got || want || "—");
+  $("model-now").style.color = s.model_mismatch ? "var(--warn, #d9534f)" : "";
+
   $("micstream-now").textContent = micStreamLabel(s.mic_stream);
-  const openTxt = s.mic_open === true ? "開著（會影響耳機）"
-    : (s.mic_open === false ? "已關閉（耳機正常）" : "—");
+  const openTxt = s.mic_open === true ? "開著"
+    : (s.mic_open === false ? "已關閉" : "—");
   $("mic-open").textContent =
     (s.mic_device != null ? openTxt + "　device " + s.mic_device : openTxt);
+
+  // 目標麥克風在不在線（藍牙省電休眠時會消失）。醒來時程式會自動切回，
+  // 所以這裡只是讓使用者知道「現在錄的是哪一支」，不必自己處理。
+  const on = s.target_online;
+  $("target-online").textContent = on === true ? "在線"
+    : (on === false ? "離線（省電休眠？醒來會自動切回）" : "—");
+  $("target-online").style.color =
+    on === false ? "var(--warn, #d9534f)" : "";
 
   $("counters").textContent =
     `按 ${s.presses} · 成功 ${s.inserted} · 空 ${s.empty} · 失敗 ${s.failed}`;
