@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 import sysconfig
@@ -38,8 +39,73 @@ ROOT = Path(__file__).resolve().parents[2]
 THIRD_PARTY = ROOT / "third_party"
 WHEEL_CACHE = ROOT / "wheels"
 
-TAG_PRIORITY = ("cp314", "cp313", "cp312", "cp311", "cp310", "abi3", "py3", "py2.py3")
-PLATFORM_PRIORITY = ("win_amd64", "win32", "any")
+
+def _python_tags() -> tuple[str, ...]:
+    """目前解譯器可用的 wheel python tag，由新到舊。
+
+    ⚠️ 原本是寫死的 `("cp314", "cp313", …)`。寫死的問題有兩個：
+      1. 換 Python 版本就要改程式碼（而且忘了改的症狀是「什麼都裝不起來」）
+      2. 它不反映**實際在跑的那個解譯器** —— 用 3.10 跑卻優先挑 cp314，
+         結果是下載了不能用的 wheel，錯誤訊息還指向別的地方
+    """
+    major, minor = sys.version_info[:2]
+    tags = [f"cp{major}{minor}"]
+    # 同一個 major 的較舊版本也可以（wheel 有向下相容的慣例）
+    for m in range(minor - 1, 5, -1):
+        tags.append(f"cp{major}{m}")
+    tags += ["abi3", "py3", "py2.py3"]
+    return tuple(tags)
+
+
+def platform_patterns(sys_platform: str | None = None,
+                      machine: str | None = None,
+                      bits: int | None = None) -> tuple[str, ...]:
+    """本平台可接受的 wheel 平台標籤，由最適配到最通用。
+
+    ⚠️ **原本寫死 `("win_amd64", "win32", "any")`** —— 那讓這個工具
+       在 macOS / Linux 上永遠選不到 wheel（`pick_wheel` 回 None），
+       症狀是「明明有 wheel 卻說找不到」。現在依實際平台與架構決定。
+
+    回傳的是**正則片段**（不是純字串），因為 macOS 的標籤長這樣：
+        macosx_11_0_arm64 / macosx_10_9_x86_64 / macosx_10_15_universal2
+    版本號與架構都必須彈性比對，不能用 `endswith` 硬猜。
+
+    三個參數都可以注入，**目的是讓每一個平台的分支都測得到** ——
+    否則「在 mac 上開發、Windows 分支沒人驗證」就會變成下一次的驚喜。
+    """
+    import platform as _platform
+
+    plat = sys_platform if sys_platform is not None else sys.platform
+    mach = (machine if machine is not None else _platform.machine()).lower()
+    nbits = bits if bits is not None else (64 if sys.maxsize > 2**32 else 32)
+
+    if plat == "darwin":
+        arch = {"arm64": "arm64", "aarch64": "arm64",
+                "x86_64": "x86_64"}.get(mach, mach)
+        return (
+            rf"macosx_\d+_\d+_{arch}",      # 最適配：指定 macOS 版本 + 本機架構
+            r"macosx_\d+_\d+_universal2",   # 通用二進位（arm64 + x86_64）
+            r"macosx_\d+_\d+_universal",
+            r"macosx_\d+_\d+_intel",
+            "any",
+        )
+    if plat == "win32":
+        bitted = "win_amd64" if nbits == 64 else "win32"
+        other = "win32" if bitted == "win_amd64" else "win_amd64"
+        return (bitted, other, "any")
+    # Linux 與其他
+    return (
+        rf"manylinux\d*_\d+_\d+_{mach}",
+        rf"musllinux_\d+_\d+_{mach}",
+        rf"linux_{mach}",
+        "any",
+    )
+
+
+TAG_PRIORITY = _python_tags()
+PLATFORM_PATTERNS = platform_patterns()
+# 相容舊名稱（原本是純字串 tuple，現在是正則；保留給外部引用）
+PLATFORM_PRIORITY = PLATFORM_PATTERNS
 
 
 def setup_console() -> None:
@@ -80,8 +146,12 @@ def wheel_rank(filename: str) -> tuple[int, int] | None:
         return None
 
     plat_rank = None
-    for i, tag in enumerate(PLATFORM_PRIORITY):
-        if plat == tag or plat.endswith(tag):
+    for i, pat in enumerate(PLATFORM_PATTERNS):
+        # ⚠️ 用正則比對而不是 `plat == tag or plat.endswith(tag)`：
+        #    macOS 的標籤是 `macosx_11_0_arm64` 這種形式，
+        #    版本號與架構都必須彈性比對，硬猜會選錯架構的 wheel
+        #    （選錯的症狀是裝得起來但 import 時才爆，而且訊息看不懂）。
+        if re.fullmatch(pat, plat):
             plat_rank = i
             break
     if plat_rank is None:

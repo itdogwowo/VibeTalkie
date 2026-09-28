@@ -4,8 +4,16 @@
 # 在 Finder 裡雙擊 .command 就會執行。第一次可能要允許執行：
 #     chmod +x "啟動 VibeTalkie.command"
 #
-# ⚠️ 目前 VibeTalkie 只有 Windows 實作，這個入口會啟動 launch.py，
-#    由它明確告知「此平台尚未支援」並停住，不會神秘失敗。
+# 這個入口會啟動 app/mac_vibetalkie.py（macOS 的實作）。
+# 它自己會處理：
+#   · Python 版本太舊 → 自動找一個合格的重新執行（透過 launch.py）
+#   · 缺相依套件／模型 → 自動下載安裝
+#   · 輔助使用／麥克風權限沒開 → 講清楚要去哪裡開
+#
+# 為什麼不直接跑 launch.py：
+#   launch.py 是**跨平台啟動器**，它會先檢查平台，macOS 目前仍會回
+#   「尚未支援」（那是給還沒有實作的平台看的）。macOS 已經有實作了，
+#   所以要直接進 mac 的進入點。
 
 cd "$(dirname "$0")" || exit 1
 
@@ -22,7 +30,7 @@ else
     exit 1
 fi
 
-"$PY" launch.py "$@"
+"$PY" app/mac_vibetalkie.py "$@"
 RC=$?
 
 if [ "$RC" -ne 0 ]; then
