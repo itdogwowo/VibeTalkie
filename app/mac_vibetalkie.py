@@ -606,6 +606,16 @@ class MacPttDaemon:
                 print("     （錄音鍵、觸發方式、模型、輸出模式都在那裡改）")
                 if open_browser:
                     ui_server.open_browser(url)
+            except ui_server.AlreadyRunning as exc:
+                # ⚠️ 這一條要單獨處理，不要落進下面的通用 except ——
+                #    「已經在執行了」不是「設定頁面壞了」，而且它會讓
+                #    **兩個行程共用 config.toml 互相覆蓋**（實測症狀：
+                #    設定存了又變回去、模型自己換掉）。訊息要具體可行。
+                print("\n  ⚠️ 已經有另一個 VibeTalkie 在用這個 port。")
+                print(f"     {exc}")
+                print("\n  同時跑兩個會讓設定互相覆蓋。請先關掉舊的那一個"
+                      "（⌘Q 完全結束，不是關視窗），")
+                print(f"  或改用別的 port：--port {ui_port + 100}")
             except Exception as exc:                    # noqa: BLE001
                 print(f"\n  ⚠️ 設定頁面啟動失敗（不影響錄音功能）：{exc}")
         else:

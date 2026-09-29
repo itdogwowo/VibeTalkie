@@ -384,12 +384,63 @@ def check_bt_mic_warning(cfg: Config, devs: list[dict]) -> str | None:
             "不是程式問題。改用 USB 或有線麥克風可完全避免。")
 
 
-def pick_port(preferred: int) -> int:
-    for p in range(preferred, preferred + 20):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", p)) != 0:
-                return p
-    return preferred
+class AlreadyRunning(Exception):
+    """已經有另一個 VibeTalkie 在用這個 port。
+
+    ## 為什麼要有這個例外（實測踩到，症狀是「設定一直被還原」）
+
+    原本 `pick_port()` 找不到可用的 port 就**直接回傳 preferred** ——
+    使用者再啟動一次時，第二個行程會靜默地換一個 port 起來，
+    而他完全不會知道。
+
+    後果不只是「兩個視窗」：
+
+      · 兩個行程**共用同一個 `config.toml`**，各自握一份記憶體
+      · `cfg.save()` 有 5 處（啟動、換麥克風、換模型、UI 儲存…），
+        每次都是**整個檔案重寫**
+      · 於是舊行程會把它記憶體裡的舊值蓋回去 —— 使用者的感受是
+        「我存了，過一陣子又變回去」，而且檔案永遠看起來是對的
+
+    實測證據（同一台機器，兩個行程都活著）：
+
+        磁碟：model_dir = "sherpa-onnx-paraformer-…"、mic_stream = "session"
+        舊行程記憶體：model_dir = ""（空）、mic_stream = "per_press"
+
+    所以**寧可拒絕啟動，也不要默默開第二個**。
+    """
+
+
+def port_in_use(port: int) -> bool:
+    """這個 port 有東西在 listen 嗎？
+
+    ⚠️ 用**綁定探測**，不是 `connect_ex()`。兩者的差別是實際踩到的 bug：
+    `connect_ex` 問的是「連得上嗎」，所以對「已綁定但還沒開始 accept」
+    或防火牆丟 RST 的 port 會回「沒人用」→ 於是回傳一個根本用不到的 port。
+    綁定探測問的才是我們真正要問的問題：「我綁得上嗎？」
+
+    `SO_REUSEADDR` **不要設**：設了會讓「已被佔用」的 port 也綁得上，
+    那樣這個函式就永遠回 False（Windows 的行為與 Linux 不同，不可依賴）。
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+
+
+def pick_port(preferred: int, span: int = 20) -> int:
+    """找一個可用的 port。
+
+    ⚠️ **找不到就丟 `AlreadyRunning`，不要靜默換一個。**
+    見 `AlreadyRunning` 的 docstring：默默開第二個實例會讓兩個行程
+    互相覆蓋 `config.toml`，而使用者只看到「設定一直被還原」。
+    """
+    for p in range(preferred, preferred + span):
+        if not port_in_use(p):
+            return p
+    raise AlreadyRunning(
+        f"{preferred}–{preferred + span - 1} 之間都已經被佔用")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -728,6 +779,39 @@ def main(argv: list[str] | None = None) -> int:
     setup_console()
 
     cfg = Config.load()
+
+    # ------------------------------------------------------------------
+    # ⚠️ **先確認沒有另一個實例在跑，再開始做任何事。**
+    #
+    # 放在最前面（早於列舉裝置、載入模型）有三個理由：
+    #
+    #   1. **快**：重複啟動會在幾十毫秒內被拒絕。放在後面的版本要等
+    #      模型載入完（數秒）才知道，使用者看到的是「按了啟動之後
+    #      卡住」而不是「已經在執行了」。
+    #   2. **不要有副作用**：下面會 `cfg.save()`（L734 原本那行）。
+    #      若先存檔才發現重複，那個「重複的行程」已經動過設定檔了 ——
+    #      而這整件事的問題就是兩個行程在動同一個檔案。
+    #   3. **不要白做**：載入模型、暖機都要時間與記憶體，全部丟掉很浪費。
+    #
+    # ⚠️ 仍然尊重 `--port`：明確指定別的 port 就是「我要刻意跑第二個」，
+    #    那是有正當用途的（測試、同時比較兩個模型），不該擋。
+    # ------------------------------------------------------------------
+    try:
+        port = pick_port(args.port or cfg.port)
+    except AlreadyRunning as exc:
+        # ⚠️ 訊息要**具體可行**，不能只說「失敗」——
+        #    使用者看到的是「我明明按了啟動」，他需要知道去哪裡關掉舊的。
+        print("\n  ⚠️ VibeTalkie 好像已經在執行了。")
+        print(f"     {exc}")
+        print("\n  同時跑兩個會讓**設定互相覆蓋**（各自記一份，存檔時整個寫回），")
+        print("  症狀是「設定存了又變回去、模型自己換掉」。所以這裡刻意拒絕啟動。")
+        print("\n  請先關掉舊的那一個：")
+        print("    · 舊的 VibeTalkie 視窗（那個黑色命令提示字元視窗）按 Ctrl+C")
+        print("    · 或在工作管理員結束 Python 行程")
+        print("\n  想刻意同時跑兩個（例如測試）請指定不同 port：")
+        print(f"    python app/vibetalkie.py --port {cfg.port + 100}")
+        return 1
+
     print("=" * 62)
     print("  VibeTalkie")
     print("=" * 62)
@@ -759,25 +843,25 @@ def main(argv: list[str] | None = None) -> int:
                            f"已暫時改用 index {dev_index}。"
                            f"請確認麥克風已開機連線，或在設定介面重新選擇。")
 
-    engine = build_engine(cfg.engine, threads=cfg.threads)
+    # ⚠️ 只建一次引擎，而且用**修正後**的 model_dir。
+    #    原本兩條分支各建一次，而 `engine.reload()` 只在第一次載入 ——
+    #    所以「設定的模型不存在 → 改用別的」那條路上，引擎其實已經被
+    #    建成指向不存在的目錄了（先建再改，改的是 cfg 不是 engine）。
     if not models.is_ready(cfg.model_dir):
         # 設定檔指的模型不在 → 退回任何一個已安裝的，沒有就給明確指引
         have = models.installed_models()
-        if have:
-            print(f"⚠️ 設定的模型「{cfg.model_dir}」不存在，改用「{have[0]}」")
-            cfg.model_dir = have[0]
-            cfg.save()
-            engine = build_engine(cfg.engine, threads=cfg.threads,
-                                  model_dir=models.model_dir(cfg.model_dir))
-        else:
+        if not have:
             print("❌ 尚未安裝任何語音模型。")
             print("   啟動後在設定介面下載，或執行：")
             print(f"   python tools/p1/fetch_model.py --get "
                   f"{models.CATALOG[0].name}")
             return 1
-    else:
-        engine = build_engine(cfg.engine, threads=cfg.threads,
-                              model_dir=models.model_dir(cfg.model_dir))
+        print(f"⚠️ 設定的模型「{cfg.model_dir}」不存在，改用「{have[0]}」")
+        cfg.model_dir = have[0]
+        cfg.save()
+
+    engine = build_engine(cfg.engine, threads=cfg.threads,
+                          model_dir=models.model_dir(cfg.model_dir))
 
     ok, why = engine.is_available()
     if not ok:
@@ -820,7 +904,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     status.daemon = daemon
 
-    port = pick_port(args.port or cfg.port)
+    # port 已經在上面確認過了（見 main() 開頭的說明）
     start_server(status, port)
     url = f"http://127.0.0.1:{port}/"
     print(f"\n設定介面：{url}")

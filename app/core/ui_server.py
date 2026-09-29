@@ -626,17 +626,54 @@ def _models_payload(cfg, force: bool = False) -> dict:
 # ---------------------------------------------------------------- 啟動
 
 
-def pick_port(preferred: int) -> int:
-    """找一個可用的 port（被佔用就往後找）。"""
+class AlreadyRunning(Exception):
+    """已經有另一個 VibeTalkie 在用這些 port。
+
+    ## 為什麼要有這個例外（實測踩到，症狀是「設定一直被還原」）
+
+    原本 `pick_port()` 找不到可用的 port 就 raise `RuntimeError`，
+    而**兩個呼叫端都沒接** —— 所以症狀是「按了啟動，跳出一個看不懂的
+    traceback」，而不是「已經在執行了，請先關掉舊的」。
+
+    但更嚴重的是 Windows 版：它那裡找不到 port 會**直接回傳 preferred**，
+    也就是默默換一個 port 起來。兩個行程共用同一個 `config.toml`，
+    各自握一份記憶體，於是舊行程會把新設定蓋回去 ——
+    使用者的感受是「我存了，過一陣子又變回去」。
+
+    實測證據（同一台機器，兩個行程都活著）：
+
+        磁碟：model_dir = "sherpa-onnx-paraformer-…"、mic_stream = "session"
+        舊行程記憶體：model_dir = ""（空）、mic_stream = "per_press"
+
+    ⚠️ 這裡是**共用層**，所以兩個平台都要有一樣的訊息與行為。
+    """
+
+
+def port_in_use(port: int) -> bool:
+    """這個 port 有東西在 listen 嗎？（用綁定探測，不是 `connect_ex`）
+
+    ⚠️ `SO_REUSEADDR` 不要設 —— 設了會讓「已被佔用」的 port 也綁得上，
+    這個函式就永遠回 False。
+    """
     import socket
-    for port in range(preferred, preferred + 20):
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError(f"{preferred}–{preferred + 19} 都被佔用了")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+
+
+def pick_port(preferred: int, span: int = 20) -> int:
+    """找一個可用的 port。
+
+    找不到就丟 `AlreadyRunning`（**呼叫端一定要接**）。
+    """
+    for port in range(preferred, preferred + span):
+        if not port_in_use(port):
+            return port
+    raise AlreadyRunning(
+        f"{preferred}–{preferred + span - 1} 之間都已經被佔用")
 
 
 def start_server(status: Status, port: int) -> ThreadingHTTPServer:
@@ -679,7 +716,15 @@ if __name__ == "__main__":
     st = Status(cfg)
     st.engine_name = getattr(cfg, "engine", "")
     st.model_wanted = getattr(cfg, "model_dir", "")
-    port = pick_port(args.port)
+    try:
+        port = pick_port(args.port)
+    except AlreadyRunning as exc:
+        print("\n  ⚠️ 已經有另一個 VibeTalkie 在用這個 port。")
+        print(f"     {exc}")
+        print("\n  同時跑兩個會讓**設定互相覆蓋**（各自記一份，存檔時整個寫回），")
+        print("  症狀是「設定存了又變回去」。請先關掉舊的，或改用別的 port：")
+        print(f"    python app/core/ui_server.py --port {args.port + 100}")
+        raise SystemExit(1) from None
     start_server(st, port)
     url = f"http://127.0.0.1:{port}/"
     print(f"UI 已經在 {url} 執行（Ctrl+C 結束）")
