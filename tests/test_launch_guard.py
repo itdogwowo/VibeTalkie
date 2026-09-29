@@ -67,19 +67,7 @@ def bind(port: int) -> socket.socket:
 
 
 def occupy_range(preferred: int, span: int) -> list[socket.socket]:
-    """佔住 `preferred` 起算的**整個範圍**。
-
-    ⚠️ 為什麼要佔滿整個範圍（實測踩到自己的測試 bug）：
-
-    `pick_port(preferred)` 的預設 `span=20`，找不到 `preferred` 就**往後讓**。
-    所以只佔住 `preferred` 一號時，第二個行程會**正常啟動在 preferred+1** ——
-    測試等到逾時，而且看起來像「防護沒生效」。
-
-    真實世界也是這樣：`pick_port` 是「preferred 起算 20 號裡找一個空的」，
-    要判定「已經在執行」就必須**整個池都被佔住**。
-    `--port` 讓使用者刻意指定別的位置（那是有正當用途的），
-    所以「讓位」本身是對的設計 —— 要拒絕的是「整個池都滿了」。
-    """
+    """佔住 `preferred` 起算的整個範圍（給「池滿了」的測試用）。"""
     out = []
     for p in range(preferred, preferred + span):
         try:
@@ -160,21 +148,28 @@ def _run() -> int:
     try:
         check("port_in_use() 認得出被佔用", vt.port_in_use(p) is True, str(p))
         try:
-            got = vt.pick_port(p, span=1)
-            check("找不到就丟 AlreadyRunning（**不要靜默換 port**）", False,
-                  f"竟然回傳了 {got}")
+            got = vt.pick_port(p)
+            check("被佔用就丟 AlreadyRunning（**不要靜默讓位**）", False,
+                  f"竟然回傳了 {got}（真實情境就是這樣漂到隔壁的）")
         except vt.AlreadyRunning as exc:
-            check("找不到就丟 AlreadyRunning（**不要靜默換 port**）", True, str(exc))
-        # span > 1 時可以往後讓 —— 那是刻意支援「--port 指定別的位置」
-        nxt = vt.pick_port(p, span=3)
-        check("往後找得到就讓位（span>1）", nxt == p + 1, str(nxt))
+            check("被佔用就丟 AlreadyRunning（**不要靜默讓位**）", True, str(exc))
+        # span > 1 是給「確定要讓位」的場合（目前沒有這種呼叫端）
+        nxt = vt.pick_port(p, span=2)
+        check("明確要求 span>1 時才讓位", nxt == p + 1, str(nxt))
     finally:
         holder.close()
 
     print("\n[2] 真的啟動第二個行程 → 要拒絕，而且訊息要可行動")
-    # 佔滿整個池（span=20），模擬「確實已經有一個實例在跑」。
+    # ⚠️ **只佔住「你想用的那一個 port」** —— 這才是真實情境。
+    #
+    #    第一版這裡佔滿了整個池（span=20），因為當時的實作是「往後找 20 個」。
+    #    那個測試**照著實作設計**，所以通過了；但真實情境是舊實例只佔著
+    #    8756 一號、8757 空著，於是 `pick_port` 讓位、第二個行程照樣起來 ——
+    #    防護完全失效（實測在使用者機器上就是這樣，見 pick_port 的 docstring）。
+    #
+    #    **測試要照真實情境設計，不是照實作設計。**
     p_used = free_port(8950)
-    holders = occupy_range(p_used, 20)
+    holder = bind(p_used)
     try:
         t0 = time.time()
         r = run_app(p_used)
@@ -190,7 +185,33 @@ def _run() -> int:
         check("**沒有載入模型**（防護在做事之前就先擋）",
               "辨識引擎：" not in out,
               "有看到「辨識引擎：」表示它先載入模型才發現重複")
+        check("沒有偷偷換 port 起來", f":{p_used + 1}/" not in out,
+              "有看到隔壁 port 的網址 = 靜默讓位又發生了")
         check("很快就結束（沒有真的跑起來）", took < 30, f"{took:.1f}s")
+    finally:
+        holder.close()
+
+    print("\n[2b] 明確指定 --port 時，被佔用也要誠實報錯（不偷偷換）")
+    p_exp = free_port(p_used + 5)
+    holder_exp = bind(p_exp)
+    try:
+        r = run_app(p_exp)
+        out = (r.stdout or "") + (r.stderr or "")
+        check("指定的 port 被佔用 → 拒絕（不是換一個）",
+              r.returncode != 0 and "已經在執行" in out,
+              f"returncode={r.returncode}")
+    finally:
+        holder_exp.close()
+
+    print("\n[2c] 整個池都被佔用 → 也要拒絕（span>1 的路徑）")
+    p_pool = free_port(p_exp + 5)
+    holders = occupy_range(p_pool, 3)
+    try:
+        try:
+            got = vt.pick_port(p_pool, span=3)
+            check("池滿了要丟 AlreadyRunning", False, f"竟然回傳了 {got}")
+        except vt.AlreadyRunning as exc:
+            check("池滿了要丟 AlreadyRunning", True, str(exc))
     finally:
         close_all(holders)
 

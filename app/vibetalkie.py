@@ -429,18 +429,37 @@ def port_in_use(port: int) -> bool:
             return True
 
 
-def pick_port(preferred: int, span: int = 20) -> int:
-    """找一個可用的 port。
+def pick_port(preferred: int, span: int = 1) -> int:
+    """取得要用的 port。**被佔用就丟 `AlreadyRunning`，不自動漂流。**
 
-    ⚠️ **找不到就丟 `AlreadyRunning`，不要靜默換一個。**
-    見 `AlreadyRunning` 的 docstring：默默開第二個實例會讓兩個行程
-    互相覆蓋 `config.toml`，而使用者只看到「設定一直被還原」。
+    ## ⚠️ 為什麼 `span` 預設是 1（這是一個實測踩到的錯誤設計）
+
+    第一版寫成「從 `preferred` 起算 20 號裡找一個空的」，理由是「port 被
+    佔用時讓位比較方便」。那個設計讓防護**完全失效**：
+
+        port_in_use(8756) → True        # 偵測正確：舊實例在跑
+        pick_port(8756)   → 8757        # 但 8757 是空的 → 讓位 → 靜默啟動第二個
+
+    真實情境就是這樣：舊實例佔著 8756，8757 當然是空的。於是使用者
+    **每次重複啟動都會成功**，而且他完全不知道 —— 接著兩個行程開始
+    互相覆蓋 `config.toml`（見 `AlreadyRunning` 的 docstring）。
+    （測試之所以沒抓到，是因為它只佔住 8756 一號，而 `span=20` 的邏輯
+    向後讓位就通过了。**測試要照真實情境設計，不是照實作設計。**）
+
+    ## 想刻意跑第二個
+
+    明確指定 `--port` 就是「我要那個位置」：那個 port 被佔用時**也是**
+    `AlreadyRunning`（誠實報錯，而不是偷偷換一個）。
+
+    `span > 1` 只在**確定要讓位**的場合才傳（目前沒有這種呼叫端）——
+    例如未來做「自動挑一個空 port 的暫時實例」。
     """
     for p in range(preferred, preferred + span):
         if not port_in_use(p):
             return p
     raise AlreadyRunning(
-        f"{preferred}–{preferred + span - 1} 之間都已經被佔用")
+        f"port {preferred} 已被佔用"
+        + (f"（{preferred}–{preferred + span - 1} 都滿了）" if span > 1 else ""))
 
 
 # ---------------------------------------------------------------- HTTP

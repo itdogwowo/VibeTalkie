@@ -664,16 +664,23 @@ def port_in_use(port: int) -> bool:
             return True
 
 
-def pick_port(preferred: int, span: int = 20) -> int:
-    """找一個可用的 port。
+def pick_port(preferred: int, span: int = 1) -> int:
+    """取得要用的 port。**被佔用就丟 `AlreadyRunning`，不自動漂流。**
 
-    找不到就丟 `AlreadyRunning`（**呼叫端一定要接**）。
+    ⚠️ `span` 預設是 1 是刻意的 —— 見 `AlreadyRunning` 的 docstring。
+    「從 preferred 起算 20 號裡找一個空的」那個設計會讓防護**完全失效**：
+    舊實例佔著 8756 時 8757 當然是空的，於是每次重複啟動都成功，
+    而兩個行程接著互相覆蓋 `config.toml`。
+
+    （Windows 版一開始就是這樣寫錯，而且測試因為只佔住一號而通過。
+    **測試要照真實情境設計，不是照實作設計。**）
     """
     for port in range(preferred, preferred + span):
         if not port_in_use(port):
             return port
     raise AlreadyRunning(
-        f"{preferred}–{preferred + span - 1} 之間都已經被佔用")
+        f"port {preferred} 已被佔用"
+        + (f"（{preferred}–{preferred + span - 1} 都滿了）" if span > 1 else ""))
 
 
 def start_server(status: Status, port: int) -> ThreadingHTTPServer:
