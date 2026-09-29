@@ -128,8 +128,19 @@ def pypi_json(name: str) -> dict:
         return json.load(resp)
 
 
-def wheel_rank(filename: str) -> tuple[int, int] | None:
-    """回傳 (python 標籤優先序, 平台優先序)；不適用的回 None。"""
+def wheel_rank(filename: str,
+               patterns: tuple[str, ...] | None = None) -> tuple[int, int] | None:
+    """回傳 (python 標籤優先序, 平台優先序)；不適用的回 None。
+
+    `patterns` 可以覆寫平台比對規則（預設用目前平台的 `PLATFORM_PATTERNS`）。
+    ⚠️ 為什麼需要這個參數（實測踩到）：測試想驗「macOS 的 wheel 選得對不對」，
+    但測試可能跑在 Windows 上 —— 那時用「目前平台」的規則去挑
+    `pyobjc-framework-Quartz` 永遠挑不到（因為它只有 macOS 的 wheel），
+    於是那條測試在任何非 macOS 的機器上都是紅的。
+
+    讓呼叫端能指定「我要用哪個平台的規則挑」之後，同一條測試在三個平台
+    都能驗同一件事。
+    """
     if not filename.endswith(".whl"):
         return None
     parts = filename[:-4].split("-")
@@ -146,7 +157,7 @@ def wheel_rank(filename: str) -> tuple[int, int] | None:
         return None
 
     plat_rank = None
-    for i, pat in enumerate(PLATFORM_PATTERNS):
+    for i, pat in enumerate(patterns or PLATFORM_PATTERNS):
         # ⚠️ 用正則比對而不是 `plat == tag or plat.endswith(tag)`：
         #    macOS 的標籤是 `macosx_11_0_arm64` 這種形式，
         #    版本號與架構都必須彈性比對，硬猜會選錯架構的 wheel
@@ -159,10 +170,15 @@ def wheel_rank(filename: str) -> tuple[int, int] | None:
     return py_rank, plat_rank
 
 
-def pick_wheel(data: dict) -> dict | None:
+def pick_wheel(data: dict,
+               patterns: tuple[str, ...] | None = None) -> dict | None:
+    """從 PyPI 的回應裡挑一個最適合的 wheel。
+
+    `patterns` 見 `wheel_rank()`：可以指定「用哪個平台的規則挑」。
+    """
     candidates = []
     for f in data["urls"]:
-        rank = wheel_rank(f["filename"])
+        rank = wheel_rank(f["filename"], patterns)
         if rank is not None:
             candidates.append((rank, f))
     if not candidates:

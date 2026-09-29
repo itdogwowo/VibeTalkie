@@ -61,20 +61,35 @@ def test_current_platform() -> None:
     check("sherpa-onnx 選得到 wheel", not missing,
           "選不到 = 這個工具在目前平台上等於廢掉")
 
-    q = fw.pick_wheel(fw.pypi_json("pyobjc-framework-Quartz"))
-    check("pyobjc-framework-Quartz 選得到 wheel", q is not None,
-          q["filename"] if q else "❌ None")
+    # ⚠️ `pyobjc-framework-Quartz` **只有 macOS 的 wheel**。
+    #
+    #    這一條原本直接 `pick_wheel(pypi_json("pyobjc-framework-Quartz"))` ——
+    #    也就是用「**目前平台**」的規則去挑。在 Windows / Linux 上跑時，
+    #    macOS 的 wheel 會被平台規則全部濾掉 → 永遠回 None → 測試永遠是紅的。
+    #
+    #    實測：這條在 `origin/mac` 上就是紅的，而且會被誤以為是整合造成的。
+    #    修法是用 `patterns=` 明確指定「用 macOS 的規則挑」—— 這樣三個平台
+    #    都能驗同一件事（PyPI 上有 Quartz 的 macOS wheel，而且挑選邏輯正確）。
+    darwin = fw.platform_patterns("darwin", "arm64", 64)
+    q = fw.pick_wheel(fw.pypi_json("pyobjc-framework-Quartz"), patterns=darwin)
+    check("pyobjc-framework-Quartz 選得到 wheel（用 macOS 規則挑）",
+          q is not None, q["filename"] if q else "❌ None")
 
     if q:
         fn = q["filename"]
         # 選到別的平台的 wheel 會「裝得起來但 import 才爆」，極難查
-        if sys.platform == "darwin":
-            bad = ("win_amd64" in fn or "win32" in fn or "manylinux" in fn
-                   or "musllinux" in fn)
-            check("不會選到 Windows/Linux 的 wheel", not bad, fn)
-        elif sys.platform == "win32":
-            check("不會選到 macOS/Linux 的 wheel",
-                  not any(t in fn for t in ("macosx", "manylinux", "musllinux")), fn)
+        if "win_amd64" in fn or "win32" in fn or "manylinux" in fn \
+                or "musllinux" in fn:
+            check("不會選到 Windows/Linux 的 wheel", False, fn)
+        else:
+            check("不會選到 Windows/Linux 的 wheel", True, fn)
+        # 明確指定 macOS 規則時，一定要挑到 macOS 的 wheel
+        check("macOS 規則挑到的是 macOS wheel", "macosx" in fn, fn)
+
+    if sys.platform == "win32":
+        check("Windows 規則**不會**挑到 macOS 的 wheel（pyobjc 在 Windows 無 wheel）",
+              fw.pick_wheel(fw.pypi_json("pyobjc-framework-Quartz")) is None,
+              "挑到 macOS wheel = 會裝起來但 import 才爆")
 
 
 def test_macos_branches() -> None:

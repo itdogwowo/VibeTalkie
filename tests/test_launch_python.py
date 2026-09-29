@@ -343,6 +343,27 @@ def main() -> int:
     print("=" * 74)
     print(f"  執行環境：Python {sys.version.split()[0]}　{sys.platform}")
 
+    # ⚠️ **這支測試只在 POSIX（macOS / Linux）上有意義。**
+    #
+    #    它用 `#!/bin/sh` 腳本 ＋ `chmod +x` 來偽造「舊版 Python 執行檔」，
+    #    而 `.sh` 在 Windows 上既不能執行、chmod 也沒有意義。測的內容又是
+    #    「`launch.py` 在 macOS 上找不到合格 Python 時重新執行自己」——
+    #    `launch.py` 對 Windows 根本不走那條路（它直接支援 win32）。
+    #
+    #    實測：這支測試在 Windows 上從來沒有通過過（會在 `write_text` 就
+    #    `PermissionError`，因為那個路徑在沙箱的暫存區），而且失敗訊息
+    #    （一個寫檔錯誤）**完全指向錯的地方** —— 看起來像權限問題或整合
+    #    造成的退化，其實只是「這支測試不該在 Windows 上跑」。
+    #
+    #    直接跳過並講清楚原因，比留著一個看不懂的紅燈誠實。
+    if sys.platform == "win32":
+        print("\n  ⏭  這支測試只適用 POSIX（macOS / Linux）。")
+        print("     它用 `#!/bin/sh` 腳本模擬舊版 Python 執行檔，並驗證")
+        print("     `launch.py` 的『找不到合格 Python 就重新執行自己』——")
+        print("     那條路徑在 Windows 上不存在（launch.py 直接支援 win32）。")
+        print("     請在 macOS 或 Linux 上跑：python tests/test_launch_python.py")
+        return 0
+
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
