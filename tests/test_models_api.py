@@ -10,6 +10,20 @@
 刻意**不**測真的下載：那會抓 78–234 MB，不該在測試裡做。
 下載路徑只測「拒絕」與「取消」的分支。
 
+## ⚠️ 這支測試不准碰使用者的 `config.toml`（實測踩到）
+
+`[2] 切換到已安裝的模型` 會呼叫 API，而那個 handler 內部會
+`status.cfg.save()` —— 預設路徑就是**真的 `config.toml`**。
+原本這裡直接 `Config.load()`，於是**跑一次測試就會改掉使用者選的模型**
+（實測：跑完之後 `config.toml` 的 mtime 變了）。
+
+而且使用者的常駐程式**同時**在讀寫同一個檔案。這一類跨行程競態最常見的
+症狀就是「偶爾紅、重跑就過」—— 本檔確實出現過一次說不出原因的紅燈。
+**這種間歇性紅燈比壞掉更糟，它會訓練人忽略紅燈。**
+
+所以比照 `test_config_api.py`：**自己的設定自己存暫存檔**
+（`cfg.save` 綁到 `TMP`），既不動使用者的檔案，也不跟他搶。
+
 執行：python tests/test_models_api.py
 """
 
@@ -18,6 +32,7 @@ from __future__ import annotations
 import json
 import socket
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -33,6 +48,9 @@ sys.path.insert(0, str(ROOT / "third_party"))
 import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
 
 _console.setup()
+
+# 自己的設定檔（絕不碰使用者的 config.toml，見檔頭）
+TMP = Path(tempfile.gettempdir()) / "vibetalkie-test-models-api.toml"
 
 import models  # noqa: E402
 from config import Config  # noqa: E402
@@ -56,7 +74,11 @@ def free_port() -> int:
 
 
 def main() -> int:
-    cfg = Config.load()
+    TMP.unlink(missing_ok=True)
+    cfg = Config()
+    # 一律寫暫存檔 —— 絕不碰使用者的 config.toml（理由見檔頭）
+    cfg.save = lambda path=None: Config.save(cfg, TMP)
+    cfg.save()
     ready = models.installed_models()
     if not ready:
         print("⚠️ 本機沒有任何已安裝模型，部分測試會略過。")
