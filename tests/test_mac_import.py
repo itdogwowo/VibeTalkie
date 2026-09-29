@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import sys
+import tokenize
 import traceback
 from pathlib import Path
 
@@ -56,6 +58,21 @@ def imported_names(path: Path) -> set[str]:
         elif isinstance(node, ast.ImportFrom) and node.module:
             found.add(node.module.split(".")[0])
     return found
+
+
+def code_only(path: Path) -> str:
+    """原始碼去掉字串與註解之後的內容（用來掃「有沒有出現某個識別字」）。
+
+    用 `tokenize` 而不是手寫行過濾：三引號 docstring 跨行，用「跳過 `#`
+    開頭的行」擋不住（實測被自己的測試抓到誤判）。
+    """
+    src = path.read_text(encoding="utf-8")
+    parts: list[str] = []
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type in (tokenize.STRING, tokenize.COMMENT):
+            continue
+        parts.append(tok.string)
+    return " ".join(parts)
 
 
 def main() -> int:
@@ -108,18 +125,16 @@ def main() -> int:
     print("\n[4] `trigger.py` 是**平台無關**的（不得出現 Win32／CG 常數）")
     tpath = ROOT / "app" / "core" / "trigger.py"
     if tpath.exists():
-        text = tpath.read_text(encoding="utf-8")
-        # 只掃「程式碼」，不掃註解與 docstring —— 註解裡提到 WM_KEYDOWN
-        # 是正當的（說明為什麼某條規則存在），不能因此判它不平台無關。
-        code_lines = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                continue
-            code_lines.append(line)
-        code = "\n".join(code_lines)
+        # ⚠️ 只掃「程式碼」—— 用 `tokenize` 濾掉字串與註解。
+        #    這些說明為什麼某條規則存在的字眼**本來就該寫在 docstring 裡**
+        #    （例如「Windows 每 ~30ms 送一次 keydown」），把它們算成違規
+        #    會逼作者刪掉註解，那是本末倒置。
+        #    自己手寫「跳過 # 開頭的行」不夠 —— 三引號 docstring 擋不住
+        #    （實測被自己的測試抓到）。
+        code = code_only(tpath)
         suspects = [tok for tok in ("WM_KEYDOWN", "WM_SYSKEYDOWN", "RI_KEY_E0",
-                                    "RAWKEYBOARD", "windll", "kCGEvent", "CGEventTap")
+                                    "RAWKEYBOARD", "windll", "kCGEvent", "CGEventTap",
+                                    "Quartz", "AVAudioEngine", "NSEvent")
                     if tok in code]
         check("沒有 Win32／CG 常數", not suspects,
               f"可疑：{suspects}" if suspects else "")
