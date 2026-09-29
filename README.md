@@ -83,13 +83,16 @@ hotkeys = ["RightCtrl", "F9,Esc", "F8,Space@double@double"]
 ## 測試
 
 ```powershell
-python tests/test_trigger.py          # 錄音鍵：多組＋左右側＋每組自己的觸發方式
-python tests/test_status_contract.py  # UI ↔ /api/status 欄位契約（兩個平台一起驗）
-python tests/test_launch_guard.py     # 拒絕重複啟動（真的開行程驗）
-python tests/test_hotkeys_patch.py    # 錄音鍵設定的驗證（兩個平台共用一份）
+python tests/run_all.py             # 一鍵跑完（掃目錄，不會漏掉新測試）
+python tests/run_all.py --list      # 只列出會跑哪些（含跳過的與原因）
+python tests/run_all.py --only ptt  # 只跑檔名含這個字串的
 ```
 
-其餘測試見 `AGENTS.md` §9。**改完一定要跑。**
+> ⚠️ 每一支測試都要呼叫 `tests/_console.py`，否則輸出被管線接走時
+> Windows 會用 cp950 編碼、測試會崩在印 `✅` 那一行。
+> `run_all.py` 也會替子行程設好 `PYTHONUTF8=1`。
+
+每一支在驗什麼見 `AGENTS.md` §9。**改完一定要跑。**
 
 ## 隱私
 

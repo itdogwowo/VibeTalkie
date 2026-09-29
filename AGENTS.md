@@ -79,6 +79,7 @@ VibeTalkie/
 │  │  ├─ speech_engine.py #   ASR 引擎（sherpa-onnx，多模型家族）
 │  │  ├─ hotkey.py        #   錄音鍵規格解析（**多組**：RightCtrl / F9 / Ctrl+Alt+R）
 │  │  ├─ trigger.py       #   ★ **平台無關的觸發狀態機**（兩個平台共用同一顆）
+│  │  ├─ launch_guard.py  #   ★ 啟動防護：這個 port 已經有實例就不開第二個
 │  │  ├─ ptt.py           #   PTT 常駐：Raw Input → 錄音 → 辨識 → 注入
 │  │  ├─ recorder.py      #   擷取封裝（自動停止、音量分析）
 │  │  ├─ record_wav.py    #   winmm waveIn 底層
@@ -99,8 +100,10 @@ VibeTalkie/
 │     └─ app.js           # UI 邏輯（改了重新整理即可，不用編譯）
 │
 ├─ tests/                 # ★ 所有測試（見 §9）
-│  ├─ test_status_contract.py   test_model_index.py   test_models_api.py
-│  └─ test_speech_engine.py     test_bandwidth.py
+│  ├─ run_all.py           #   一鍵跑完（掃目錄，**清單的單一來源**）
+│  ├─ _console.py          #   測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+│  ├─ test_shared_layer.py #   ★ 同一條規則只能有一份實作（AST 掃定義）
+│  └─ …（共 22 支；每一支在驗什麼見 §9）
 │
 ├─ tools/                 # ★ 只有工具（**不被產品匯入**）
 │  ├─ p0/enumerate_audio.ps1            # T1 端點列舉
@@ -176,6 +179,7 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 | `textin` | 剪貼簿貼上 → 失敗則逐字輸入 | 不產生文字 |
 | `hotkey` | 按鍵**規格**的解析與比對（名稱／側別／多組綁定） | 不維護觸發狀態 |
 | `trigger` | 按鍵**事件** → 開始／停止的決策（多組命中／雙邊行為／停用／測試模式） | 不碰音訊、不碰平台 API |
+| `launch_guard` | 重複啟動的偵測與拒絕（port 已被佔用 → 不開第二個實例） | 不管音訊、不管 UI、不決定訊息印在哪 |
 | `config` | TOML 讀寫（serde） | 不驗證業務邏輯 |
 
 ### ⚠️ 為什麼有 `trigger.py`（兩個平台共用同一顆引擎）
@@ -190,6 +194,25 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 也沒有 `ctypes`／`Quartz`／`WM_KEYDOWN`。平台層只提供兩個回呼
 （`on_start`／`on_finish`）與一個事件（`trigger.Event`）。
 `tests/test_mac_import.py` 用 AST 掃 import、用 `tokenize` 掃程式碼區把這件事釘住。
+
+### ⚠️ 同一招也用在 `launch_guard.py`（而且是被咬第二次才補的）
+
+`vibetalkie.py`（Windows）與 `ui_server.py`（mac）原本**各有一份**
+`pick_port()`／`port_in_use()`／`AlreadyRunning`。兩份一開始一樣，後來只改了
+一份 —— 而這一條規則的漂移症狀是**「設定存了又變回去」**：兩個行程共用
+`config.toml`、各自握一份記憶體，`cfg.save()` 每次整個檔案重寫，舊的那個
+會把新值蓋掉。
+
+所以規則搬到 `app/core/launch_guard.py`：**規則住共用層、平台差異當參數**
+（`explain()` 決定講什麼，Windows 傳「去工作管理員關掉」、mac 傳「⌘Q」）。
+
+> 📌 **教訓：規範寫在文件裡擋不住這件事。** 這個 repo 到處都是「不要各寫一份」
+> 的註解，還是多寫了一份。能擋住的是**會失敗的測試** ——
+> `tests/test_shared_layer.py` 用 AST 數每一條已共用規則的定義次數，
+> 只能有一份；搬位置可以，但要同時改那張表（刻意的摩擦）。
+>
+> 同一個道理的另一個證據：`AGENTS.md` §9 的測試清單本身在一小時內就漂移過
+> （實際 22 支、清單寫 20 支）→ 現在改成掃目錄的 `tests/run_all.py`。
 
 ---
 
@@ -816,29 +839,46 @@ mac 內建麥克風講話時峰值實測 **82–110（0.25–0.34% FS）**。
 ### 改完一定要跑的測試
 
 ```powershell
-python tests/test_status_contract.py       # UI ↔ /api/status 欄位契約
-python tests/test_model_index.py           # 模型分類器（可用/不可用判斷）
-python tests/test_model_index.py --live    # 對真實 499 筆跑統計（需連網）
-python tests/test_models_api.py            # 模型下載／切換 API
-python tests/test_speech_engine.py    # 引擎介面、PCM 轉換、簡繁
-python tests/test_bandwidth.py        # 頻寬判定器（會決定準確率門檻）
-python tests/test_mic_stream.py       # 串流模式、緩衝區回收、裝置復歸
-python tests/test_config_api.py       # /api/config 欄位契約與驗證
-python tests/test_trigger.py          # 錄音鍵：多組＋左右側＋每組自己的觸發方式
-python tests/test_launch_python.py    # 啟動器的 Python 自動尋找（挑最舊合格版／防無限迴圈）
-python tests/test_wheel_platform.py   # wheel 平台選擇（mac/windows/linux 三分支都測）
-python tests/test_autosetup.py        # 相依自動安裝（偵測／--no-install／依賴展開）
+python tests/run_all.py             # 一鍵跑完 tests/ 底下所有測試
+python tests/run_all.py --list      # 只列出會跑哪些（含跳過的與原因）
+python tests/run_all.py --only ptt  # 只跑檔名含這個字串的
 ```
 
-整合之後另外多了這幾支（**任何平台都能跑，不需要 pyobjc**）：
+> ⚠️ **不要再手寫測試清單。** 這裡原本是一串 20 條指令，而實際發生過：
+> `tests/` 裡已經 22 支，清單只列 20 支 —— 漏掉的那兩支（`test_launch_guard.py`、
+> `test_mac_keys.py`）從此沒人跑，而且沒有任何東西會告訴你。
+> 現在由 `run_all.py` 掃目錄，清單不會再漂移。
+>
+> ⚠️ **每一支測試都要呼叫 `tests/_console.py`**（`_console.setup()`）。
+> Windows 的 Python 在輸出**被管線接走**時用的是地區設定（cp950）而不是
+> 主控台代碼頁，測試會崩在印 `✅` 那一行 —— 實測 22 支裡有 12 支是這樣紅的，
+> 看起來像產品壞了，其實是測試的輸出壞了（同 §8.6 的規則，只是對象是測試）。
+> `run_all.py` 也會把 `PYTHONUTF8=1` 傳給子行程；**兩邊都要做**，
+> 因為直接跑單支時沒有那個環境變數。
 
-```powershell
-python tests/test_hotkey_names.py     # canonical 名稱契約（名稱／側別／平台鍵碼）
-python tests/test_trigger_engine.py   # 觸發引擎（平台無關，直接餵 Event）
-python tests/test_hotkeys_patch.py    # /api/config 的 hotkeys 驗證（兩平台共用一份）
-python tests/test_mac_import.py       # mac 模組的可載入性＋共用層不得有平台相依
-python tests/test_mac_trigger.py      # mac 的觸發行為（原本被 pyobjc 閘門擋住）
-```
+各支測試在驗什麼：
+
+| 測試 | 內容 |
+|---|---|
+| `test_status_contract.py` | UI ↔ `/api/status` 欄位契約（讀 `app/ui/app.js`） |
+| `test_model_index.py` | 模型分類器（`--live` 對真實 499 筆跑統計，需連網） |
+| `test_models_api.py` | 模型下載／切換 API |
+| `test_speech_engine.py` | 引擎介面、PCM 轉換、簡繁 |
+| `test_bandwidth.py` | 頻寬判定器（會決定準確率門檻） |
+| `test_mic_stream.py` | 串流模式、緩衝區回收、裝置復歸（§8.2.1） |
+| `test_config_api.py` | `/api/config` 欄位契約與驗證 |
+| `test_trigger.py` | 錄音鍵：多組＋左右側＋每組自己的觸發方式（§8.2 規則 4） |
+| `test_hotkey_names.py` | canonical 名稱契約（名稱／側別／平台鍵碼） |
+| `test_trigger_engine.py` | 觸發引擎（平台無關，直接餵 `Event`） |
+| `test_hotkeys_patch.py` | `/api/config` 的 hotkeys 驗證（兩平台共用一份） |
+| `test_launch_guard.py` | 重複啟動要拒絕（**真的開行程佔 port**，不只看原始碼） |
+| `test_shared_layer.py` | ★ 同一條規則只能有一份實作（AST 掃定義，見 §5） |
+| `test_launch_python.py` | 啟動器的 Python 自動尋找（挑最舊合格版／防無限迴圈） |
+| `test_wheel_platform.py` | wheel 平台選擇（mac/windows/linux 三分支都測） |
+| `test_autosetup.py` | 相依自動安裝（偵測／`--no-install`／依賴展開） |
+| `test_mac_import.py` | mac 模組的可載入性＋共用層不得有平台相依 |
+| `test_mac_trigger.py` / `test_mac_keys.py` | mac 的觸發行為與鍵名對照（**不需要 pyobjc**） |
+| `test_mac_ui_contract.py` / `test_mac_api_contract.py` | mac 的 `snapshot()` 與 HTTP 回應形狀 |
 
 > ⚠️ `test_mac_trigger.py` 與 `test_mac_keys.py` **不需要 pyobjc** ——
 > `mac_vibetalkie.py` 與三個 mac 模組都刻意不在頂層 import 原生 API，
