@@ -136,6 +136,7 @@ def ensure_dependencies(auto: bool = True) -> bool:
 import config as config_module          # noqa: E402
 import hotkey as hotkey_mod             # noqa: E402
 import keys as keys_mod                 # noqa: E402
+import trigger as trigger_mod           # noqa: E402（平台無關的觸發狀態機）
 from speech_engine import (             # noqa: E402
     EngineNotConfigured,
     EngineUnavailable,
@@ -200,22 +201,87 @@ class MacPttDaemon:
         self._cap: recorder.MacCapture | None = None
         self._lock = threading.RLock()
         self._rec_started = 0.0
-        self._pressed = False                # 目前是否處於「已按下」狀態
-        self._last_tap = 0.0                 # double 模式用
         self._stop = False
-        # 目前按住的修飾鍵（canonical 名稱：ctrl/shift/alt/win）
-        self._mods_down: set[str] = set()
         self.stats = {"inserted": 0, "empty": 0, "failed": 0, "too_short": 0}
         self.last_latency: dict | None = None
+        # 錄音鍵（多組）的解析快取 —— 與 Windows 版同一套規則
+        self._hotkey_raw: tuple[str, ...] | None = None
+        self._hotkey_bindings = None
+        self._hotkey_error: str | None = None
+
+        # ------------------------------------------------ 觸發狀態機
+        #
+        # 與 Windows 版**共用同一顆引擎**（`app/core/trigger.py`）。
+        #
+        # ⚠️ 這裡原本有一份自己的實作（`_last_tap` ＋ `_spec_matches` ＋
+        #    一個 `mode` 分支），但它只有「單一顆鍵 + 全域模式」——
+        #    main 新增的「多組／開始結束配對／兩邊各自的行為／停用／測試模式」
+        #    它一項都沒有。兩份實作一定會漂移，所以刪掉自己的，改用共用的。
+        self.trigger = trigger_mod.TriggerEngine(
+            get_bindings=self._bindings,
+            on_start=self._on_trigger_start,
+            on_finish=self._on_trigger_finish,
+            double_window=float(getattr(cfg, "double_tap_ms", 400) or 400) / 1000.0,
+            debug=debug,
+        )
 
     # ------------------------------------------------------------ 設定
 
+    def _bindings(self):
+        """目前生效的錄音鍵（**多組**、每組各自帶觸發方式，跟著設定檔更新）。
+
+        與 Windows 版的差別**只有資料來源**（這裡直接讀 `self.cfg`，
+        Windows 版走 `_live()` 的熱重載快取）。解析規則完全共用
+        —— 包含「打錯字的那一組被指出來、認得的仍然生效」。
+
+        ⚠️ 每一次呼叫都會重讀設定（`effective_hotkeys()`），所以改
+        `config.toml` 之後**不必重啟**（`test_mac_trigger.py` 有釘住這條）。
+        """
+        raw = tuple(getattr(self.cfg, "effective_hotkeys", lambda: [])() or [])
+        if raw == self._hotkey_raw and self._hotkey_bindings is not None:
+            return self._hotkey_bindings
+        # ⚠️ 要先記下舊值再覆蓋 —— `err != self._hotkey_error` 這種比法在
+        #    「換了綁定但錯誤訊息一樣」時會漏掉清配對（實測踩到自己的 bug）。
+        changed = raw != self._hotkey_raw
+        bind, err = hotkey_mod.bindings(
+            list(raw), default_mode=getattr(self.cfg, "trigger_mode", "hold"))
+        self._hotkey_raw = raw
+        self._hotkey_bindings = bind
+        self._hotkey_error = err
+        # 綁定換了就清掉「等待第二下」的殘留狀態 —— 舊的配對屬於舊的鍵。
+        if changed:
+            self.trigger.tap_at = {}
+        # 使用者可能在 UI 改過「雙擊間隔」—— 每次重讀設定時一起同步
+        self.trigger.double_window = \
+            float(getattr(self.cfg, "double_tap_ms", 400) or 400) / 1000.0
+        if err:
+            print(f"  ⚠️ 錄音鍵設定有問題（{err}）—— 目前生效的是 {bind.label}")
+        return bind
+
     def spec(self) -> hotkey_mod.HotkeySpec:
-        """目前的錄音鍵規格（每次重讀，改 config.toml 立刻生效）。"""
-        spec, err = hotkey_mod.parse_or_default(getattr(self.cfg, "hotkey", ""))
-        if err and self.debug:
-            print(f"  ⚠️ 按鍵設定無法解析，改用預設：{err}")
-        return spec
+        """目前錄音鍵的**第一組**規格（相容舊呼叫端；新程式請用 `_bindings()`）。"""
+        bind = self._bindings()
+        if bind.specs:
+            return bind.specs[0]
+        return hotkey_mod.parse(hotkey_mod.DEFAULT_SPEC)
+
+    @property
+    def _pressed(self) -> bool:
+        """使用者此刻是不是按著（引擎的 `pressed`；相容舊名稱）。"""
+        return self.trigger.pressed
+
+    @_pressed.setter
+    def _pressed(self, value: bool) -> None:
+        self.trigger.pressed = bool(value)
+
+    @property
+    def _mods_down(self) -> set[str]:
+        """目前按住的修飾鍵（引擎的狀態；相容舊名稱）。"""
+        return self.trigger.mods_down
+
+    @_mods_down.setter
+    def _mods_down(self, value) -> None:
+        self.trigger.mods_down = set(value)
 
     def _live(self) -> dict:
         c = self.cfg
@@ -300,6 +366,21 @@ class MacPttDaemon:
                 pass
         else:
             self.ui.level = 0.0
+
+        # ---- 錄音鍵（多組）＋ 測試模式 ----
+        #
+        # ⚠️ 這幾個欄位是**新 UI 要求**的（`app/ui/app.js` 讀
+        #    `s.hotkeys` / `s.key_enabled` / `s.hotkeys_label` /
+        #    `s.hotkey_warning` / `s.key_test`）。少了它們的症狀是
+        #    「畫面有欄位、後端不認」—— UI 顯示 undefined 而後端毫無錯誤。
+        #    兩個平台共用同一份 UI，所以欄位名要與 Windows 版一字不差。
+        bind = self._bindings()
+        self.ui.hotkey_label = bind.label
+        self.ui.hotkeys_label = bind.label
+        self.ui.hotkey_error = self._hotkey_error
+        self.ui.hotkey_warning = (f"錄音鍵設定有問題：{self._hotkey_error}"
+                                  if self._hotkey_error else None)
+        self.ui.key_test = self.trigger.test_state()
 
     # ------------------------------------------------------------ 錄音
 
@@ -412,98 +493,69 @@ class MacPttDaemon:
 
     # ------------------------------------------------------------ 熱鍵分派
 
-    def _spec_matches(self, ev: KeyEvent) -> bool:
-        """這個事件是不是「我們要的那顆鍵」。
+    def _on_trigger_start(self, label: str) -> None:
+        """引擎說「開始」→ 這裡只負責開麥克風。"""
+        self._start_recording(label)
 
-        比對方式與 Windows 版一致：主鍵名稱相同 + 修飾鍵集合完全吻合。
+    def _on_trigger_finish(self, pressed: bool) -> None:
+        """引擎說「停止」→ 這裡只負責收尾。
 
-        ## 「限定右側」在 mac 上怎麼處理
-
-        Windows 用 `E0` 旗標區分左右 Ctrl，`HotkeySpec.require_e0` 記的就是它。
-        macOS **沒有 E0**，但左右是不同的 keycode（左 Ctrl=59、右 Ctrl=62），
-        所以照樣做得到 —— 只要把 `require_e0` 翻成 `right` 開頭的名稱：
-
-            RightCtrl  → spec.require_e0=True, vk→"ctrl"  → 比對 "rightctrl"
-            LeftCtrl   → spec.require_e0=False            → 比對 "ctrl"
-            F9         → 本來就不是修飾鍵                → 比對 "f9"
+        ⚠️ `pressed` 留給 Windows 的自動重錄用；mac 版沒有那道手續
+        （AVAudioEngine 的串流不像藍牙 SCO 有「第一次收不到音」的問題 ——
+        那個問題在 mac 上**還沒量過**，見 AGENTS.md §7 的待驗證清單）。
         """
-        want_key = _main_key_name(self.spec())
-        if ev.key != want_key:
-            return False
+        self._finish_recording()
 
-        spec = self.spec()
-        want = {m.lower() for m in spec.modifiers}
-        have = {keys_mod.generic_modifier(k) for k in self._mods_down}
+    def _spec_matches(self, ev: KeyEvent) -> bool:
+        """這個事件是不是「我們要的那顆鍵」。（**相容用**，內部走引擎）
 
-        # 主鍵自己若是修飾鍵（「單獨按 Ctrl」那種熱鍵），
-        # 它會同時出現在 _mods_down 裡，但 spec.modifiers 是空的 ——
-        # 所以要把主鍵從「目前按住的修飾鍵」中排除，否則永遠不吻合。
-        if keys_mod.is_modifier(want_key):
-            have.discard(keys_mod.generic_modifier(want_key))
-        return want == have
+        ⚠️ 這原本是 mac 自己的一份比對實作，靠 `_main_key_name()` 把
+        `HotkeySpec`（那時是 VK 中心）翻譯成名稱。現在 `HotkeySpec`
+        自己就講 canonical 名稱（見 `app/core/hotkey.py`），比對也統一由
+        `hotkey.spec_hit()` 負責 —— **翻譯層整段不需要了**。
+
+        保留這個方法是為了 `tests/test_mac_trigger.py` 的舊斷言
+        （「改了 config.toml 之後 f9 不再觸發」），它與新介面同義。
+        """
+        b = self._bindings()
+        return any(hotkey_mod.spec_hit(s, ev.key) for s in b.active)
 
     def _allow_any_device(self) -> bool:
         """mac 版恆為 True —— 沒有裝置辨識，也不該假裝有。
 
-        保留這個方法讓分派邏輯與 Windows 版形狀一致，方便日後比對。
+        AGENTS.md §8.7 已實測：CGEventTap 的四個候選欄位（keyboardType／
+        sourceUserData／sourceStateID／tabletEventDeviceID）在藍牙裝置與
+        實體鍵盤上**完全相同**，做不到裝置辨識。
+
+        引擎只照做 `Event.device_ok`（mac 恆為 True），所以這個方法存在的
+        意義是「與 Windows 版形狀一致」＋讓測試能明確斷言這條限制。
         """
         return True
 
     def _handle_key(self, ev: KeyEvent) -> None:
-        """平台無關的按鍵處理（Windows 版 `_handle_key` 的對應）。"""
-        # 修飾鍵狀態**先**更新 —— 主鍵判定會用到
-        if keys_mod.is_modifier(ev.key):
-            gen = keys_mod.generic_modifier(ev.key)
-            if ev.down:
-                self._mods_down.add(ev.key)
-            else:
-                self._mods_down.discard(ev.key)
-            if self.debug and ev.down:
-                print(f"  · 修飾鍵 {gen} 按下（目前 {sorted(self._mods_down)}）")
+        """CGEventTap 事件 → 平台無關的 `trigger.Event`（只做轉譯）。
 
-        # 自動重複要忽略 —— 按住不放會一直送 DOWN
-        if ev.autorepeat:
-            return
-
-        spec = self.spec()
-        if not self._spec_matches(ev):
-            return
-
-        if self.debug:
-            print(f"  · 接受 {spec.label} {'DOWN' if ev.down else 'UP  '}")
-
+        ⚠️ 這一層**不做任何觸發判斷** —— 判斷都在 `app/core/trigger.py`。
+        mac 的 keycode **本身就分左右**（左 Ctrl=59、右 Ctrl=62），
+        所以側別直接寫在 `ev.key` 裡（`"rightctrl"`），不必也不能靠旗標。
+        """
         with self._lock:
-            mode = getattr(self.cfg, "trigger_mode", "hold")
-            if mode == "hold":
-                if ev.down and not self._pressed:
-                    self._pressed = True
-                    self._start_recording(spec.label)
-                elif not ev.down and self._pressed:
-                    self._pressed = False
-                    self._finish_recording()
-            elif mode == "toggle":
-                if ev.down:
-                    if self.state == "RECORDING":
-                        self._finish_recording()
-                    else:
-                        self._start_recording(spec.label)
-            elif mode == "double":
-                if ev.down:
-                    now = time.monotonic()
-                    gap = (now - self._last_tap) * 1000
-                    self._last_tap = now
-                    if gap <= float(getattr(self.cfg, "double_tap_ms", 400)):
-                        self._last_tap = 0.0
-                        if self.state == "RECORDING":
-                            self._finish_recording()
-                        else:
-                            self._start_recording(spec.label + "（雙擊）")
+            self.trigger.feed(trigger_mod.Event(
+                key=ev.key, down=ev.down,
+                mods=frozenset(self.trigger.mods_down),
+                device=ev.device,          # macOS 恆為 None（實測無法取得）
+                device_ok=True,            # 不做裝置政策（見 _allow_any_device）
+                autorepeat=ev.autorepeat,
+            ))
 
     # ------------------------------------------------------------ 主迴圈
 
     def run(self, seconds: float | None = None, ui: bool = True,
             ui_port: int = 8756, open_browser: bool = True) -> int:
-        self._mods_down: set[str] = set()
+        # ⚠️ 修飾鍵狀態由引擎持有（`self.trigger.mods_down`），這裡只清空它。
+        #    直接指派 `self._mods_down = set()` 也可以（有 property setter），
+        #    但寫成「清空既有的集合」更明確：引擎握著同一個物件。
+        self.trigger.mods_down.clear()
 
         # 先把權限與引擎問題講清楚，不要等使用者按了才發現
         listener = keylistener.MacKeyListener(self._handle_key, debug=self.debug)
@@ -605,31 +657,6 @@ def _mic_label() -> str:
     except Exception:                                   # noqa: BLE001
         pass
     return "系統預設輸入裝置"
-
-
-def _main_key_name(spec) -> str:
-    """`HotkeySpec` → 主鍵的 canonical 平台名稱。
-
-    ## 為什麼需要這個轉換
-
-    `HotkeySpec` 存的是 **Windows VK 碼**（歷史因素：`hotkey.py` 原本只有
-    Windows）。但 mac 需要的是名稱，而且**左右修飾鍵要用不同名稱**才能
-    區分（mac 用 keycode 分左右，Windows 用 E0 旗標）。
-
-    所以：
-
-        spec.vk=0x11 + require_e0=True   → "rightctrl"   （右 Ctrl）
-        spec.vk=0x11 + require_e0=False  → "ctrl"        （左 Ctrl）
-        spec.vk=0x78                     → "f9"
-
-    這個函式是 `keys.py` 存在的理由的具體體現 ——
-    VK 碼是平台專屬的，名稱才是共通語言。
-    """
-    import hotkey as hk
-    name = (hk.VK_TO_NAME.get(spec.vk) or "").lower()
-    if spec.require_e0 and name in ("ctrl", "shift", "alt"):
-        return "right" + name
-    return name
 
 
 def run_mic_test(seconds: float = 4.0, model: str | None = None) -> int:

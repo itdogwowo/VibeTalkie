@@ -55,9 +55,15 @@ def main() -> int:
 
     try:
         import Quartz  # noqa: F401
-    except ImportError as exc:
-        print(f"\n  ❌ 需要 pyobjc：{exc}")
-        return 2
+    except ImportError:
+        # ⚠️ **不是跳過** —— 這支測試測的是觸發狀態機與設定熱重載，
+        #    兩者都**不需要 pyobjc**：`mac_vibetalkie.py` 與三個 mac 模組
+        #    都刻意不在頂層 import 原生 API（`tests/test_mac_import.py`
+        #    把這個性質釘住）。原本這裡直接 return 2，等於讓這支測試在
+        #    非 macOS 上完全無法執行 —— 那會讓整合期間的每一次重構都失去
+        #    這一層保護，而且真正的覆蓋率是 0 卻看起來「只是跳過」。
+        #    真需要原生的測試是 `test_mac_e2e.py` / `test_mac_devices.py`。
+        print("  ℹ️ 沒有 pyobjc —— 只跑不需要原生的部分（狀態機）")
 
     spec = importlib.util.spec_from_file_location(
         "mvd", ROOT / "app" / "mac_vibetalkie.py")
@@ -230,6 +236,91 @@ def main() -> int:
           d.stats["inserted"] == before["inserted"]
           and d.stats["too_short"] > before.get("too_short", 0),
           str(d.stats))
+
+    # ------------------------------------------------ 多組／配對／停用／測試
+    #
+    # ⚠️ 這一段是整合之後 mac 才有的能力（原本 mac 只有「單一顆鍵 +
+    #    全域 trigger_mode」）。`FakeCapture.opened` 是最有力的斷言 ——
+    #    它直接證明「有沒有真的開麥克風」，比看 `d.state` 更接近使用者的體驗。
+    print("\n▍多組錄音鍵（mac 原本只有一顆）")
+
+    def multi(entries, double_ms=400):
+        cfg = config_module.Config()
+        cfg.hotkeys = entries
+        cfg.trigger_mode = "hold"
+        cfg.double_tap_ms = double_ms
+        d = mvd.MacPttDaemon(cfg, dry_run=True, debug=False)
+        d.engine = _StubEngine()
+        FakeCapture.opened = FakeCapture.closed = 0
+        return d
+
+    d = multi(["RightCtrl", "F9"])
+    send(d, "rightctrl", True)
+    check("第一組（RightCtrl）可用", d.state == "RECORDING", d.state)
+    send(d, "rightctrl", False)
+    send(d, "f9", True)
+    check("第二組（F9）也可用 —— 這才是「多組」", d.state == "RECORDING", d.state)
+    send(d, "f9", False)
+    check("放開 → 停", d.state != "RECORDING", d.state)
+
+    print("\n▍開始／結束可以是不同顆鍵（配對）")
+    d = multi(["F9,Esc"])
+    send(d, "f9", True)
+    check("按 F9 → 開始", d.state == "RECORDING", d.state)
+    send(d, "f9", False)
+    check("放開 F9 **不會**結束", d.state == "RECORDING", d.state)
+    send(d, "esc", True)
+    check("Esc 按下時還沒停（鬆開才停）", d.state == "RECORDING", d.state)
+    send(d, "esc", False)
+    check("鬆開 Esc → 停", d.state != "RECORDING", d.state)
+
+    d = multi(["F9,Esc@toggle"])
+    send(d, "f9", True)
+    send(d, "f9", False)
+    send(d, "esc", True)
+    check("結束行為 toggle → Esc 一按下就停", d.state != "RECORDING", d.state)
+    send(d, "esc", False)
+
+    print("\n▍停用（`~` 前綴）：停用的組合完全不理")
+    d = multi(["~F9", "F8"])
+    send(d, "f9", True)
+    check("停用的 F9 不觸發", d.state != "RECORDING", d.state)
+    check("而且沒有開麥克風", FakeCapture.opened == 0, str(FakeCapture.opened))
+    send(d, "f9", False)
+    send(d, "f8", True)
+    check("同一份清單裡啟用的 F8 照常可用", d.state == "RECORDING", d.state)
+    send(d, "f8", False)
+
+    print("\n▍側別：LeftCtrl 不該被右 Ctrl 觸發（實測踩過的 bug）")
+    d = multi(["LeftCtrl"])
+    send(d, "rightctrl", True)
+    check("右 Ctrl 不觸發", d.state != "RECORDING", d.state)
+    send(d, "rightctrl", False)
+    send(d, "ctrl", True)                      # 左 Ctrl（mac 的 keycode 不同）
+    check("左 Ctrl 觸發", d.state == "RECORDING", d.state)
+    send(d, "ctrl", False)
+
+    print("\n▍「測試」模式：只聽、不錄、不注入")
+    d = multi(["F9,Esc"])
+    st = d.trigger.start_key_test(5.0, "F9")
+    check("可以啟動", st.get("ok") is True, str(st))
+    send(d, "f9", True)
+    send(d, "esc", True)
+    send(d, "a", True)
+    check("測試期間**完全沒有開麥克風**", FakeCapture.opened == 0,
+          str(FakeCapture.opened))
+    check("也沒有進入 RECORDING", d.state != "RECORDING", d.state)
+    hits = d.trigger.test_state()["hits"]
+    check("收到三個事件", len(hits) == 3, str(len(hits)))
+    check("F9 被認成開始鍵", "開始鍵" in hits[0]["roles"][0], str(hits[0]["roles"]))
+    check("Esc 被認成結束鍵", "結束鍵" in hits[1]["roles"][0], str(hits[1]["roles"]))
+    check("沒設定的鍵回報「不相關」",
+          "不相關的鍵" in hits[2]["roles"][0], str(hits[2]["roles"]))
+    send(d, "f9", False)
+    send(d, "esc", False)
+    send(d, "a", False)
+    d.trigger.cancel_key_test()
+    check("可以取消", d.trigger.test_state()["running"] is False)
 
     print("\n" + "=" * 74)
     if failures:
