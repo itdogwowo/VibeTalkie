@@ -18,6 +18,14 @@
    `mic_name` 一起重設掉。修法是把 `cfg.save` 導向暫存檔（見下方）。
    **測試不准動使用者的設定。**
 
+3. **錄音鍵從單一字串變成清單**（[6]–[8]）：多組之後最危險的失敗模式是
+   「靜默」——
+     · 清單裡有一組打錯字 → 若整批丟掉，使用者會發現「全部都不能用」，
+       但那不是他的原意；若靜默只留好的，他又不知道有東西被吃掉。
+       所以規則是：**壞的要明確回 400 並指出是哪一個**。
+     · 空清單 → 等於「按什麼都不會錄音」，看起來卻儲存成功。也回 400。
+     · `F9` 與 `f9` 是同一組 → 去重要比解析後的規格，不是字串。
+
 執行：python tests/test_config_api.py
 """
 
@@ -133,6 +141,130 @@ def main() -> int:
         raw = TMP.read_text(encoding="utf-8")
         check("TOML 有 [bluetooth] 區段", "[bluetooth]" in raw)
         check("TOML 裡有 mic_stream", "mic_stream" in raw)
+
+        print("\n[6] 錄音鍵是**清單**（可多組），而且每一組都要能解析")
+        st, body = post("/api/config", {"hotkeys": ["RightCtrl", "F9", "Ctrl+Alt+R"]})
+        check("接受三組", st == 200 and body.get("ok"), f"HTTP {st} {body}")
+        c = get("/api/config")
+        check("GET 回傳三組", c.get("hotkeys") == ["RightCtrl", "F9", "Ctrl+Alt+R"],
+              str(c.get("hotkeys")))
+        check("舊欄位 hotkey = 第一組（相容）", c.get("hotkey") == "RightCtrl",
+              str(c.get("hotkey")))
+        check("程式內部的 Config 也更新了",
+              cfg.effective_hotkeys() == ["RightCtrl", "F9", "Ctrl+Alt+R"],
+              str(cfg.effective_hotkeys()))
+
+        print("  （打錯字的按鍵必須被拒絕，而且不可改壞原設定）")
+        st, body = post("/api/config", {"hotkeys": ["F9", "Banana"]})
+        check("非法按鍵回 400", st == 400, f"HTTP {st}")
+        check("錯誤訊息指得出是哪一個", "Banana" in str(body.get("error", "")),
+              str(body.get("error")))
+        check("原設定沒有被改壞",
+              cfg.effective_hotkeys() == ["RightCtrl", "F9", "Ctrl+Alt+R"],
+              str(cfg.effective_hotkeys()))
+
+        print("  （空清單也要拒絕 —— 一個鍵都沒有＝按什麼都不會錄音）")
+        st, body = post("/api/config", {"hotkeys": []})
+        check("空清單回 400", st == 400, f"HTTP {st}")
+        check("說明看得懂", "至少" in str(body.get("error", "")), str(body.get("error")))
+        check("原設定仍然沒被改壞",
+              cfg.effective_hotkeys() == ["RightCtrl", "F9", "Ctrl+Alt+R"],
+              str(cfg.effective_hotkeys()))
+
+        print("  （重複的寫法要去重：F9 / f9 是同一組）")
+        post("/api/config", {"hotkeys": ["F9", "f9", "RightCtrl"]})
+        check("去重後剩兩組", cfg.effective_hotkeys() == ["F9", "RightCtrl"],
+              str(cfg.effective_hotkeys()))
+
+        print("  （舊版 UI 只送單一字串 hotkey 也要能用）")
+        st, body = post("/api/config", {"hotkey": "F8"})
+        check("接受舊欄位", st == 200 and body.get("ok"), f"HTTP {st}")
+        check("變成只有一組", cfg.effective_hotkeys() == ["F8"],
+              str(cfg.effective_hotkeys()))
+
+        print("\n[7] 錄音鍵清單要能寫進檔案並讀回來")
+        post("/api/config", {"hotkeys": ["RightCtrl", "F9"]})
+        again = config_module.Config.load(TMP)
+        check("重新載入後仍是兩組", again.effective_hotkeys() == ["RightCtrl", "F9"],
+              str(again.effective_hotkeys()))
+        raw = TMP.read_text(encoding="utf-8")
+        check("TOML 是**陣列**而不是字串（踩過：清單被 str() 成 \"[]\"）",
+              'hotkeys = ["RightCtrl", "F9"]' in raw,
+              [ln for ln in raw.splitlines() if "hotkeys" in ln])
+
+        print("\n[9] 每一組可以有自己的觸發方式（`F9@double`）")
+        st, body = post("/api/config",
+                        {"hotkeys": ["RightCtrl", "F9@double", "F8@toggle"]})
+        check("接受每組模式", st == 200 and body.get("ok"), f"HTTP {st} {body}")
+        c = get("/api/config")
+        check("GET 原樣回傳清單",
+              c.get("hotkeys") == ["RightCtrl", "F9@double", "F8@toggle"],
+              str(c.get("hotkeys")))
+        check("另外給 UI 一份拆好的模式對照（省得前端自己切 `@`）",
+              c.get("key_modes") == {"RightCtrl": {"start": "hold", "end": ""},
+                                     "F9@double": {"start": "double", "end": ""},
+                                     "F8@toggle": {"start": "toggle", "end": ""}},
+              str(c.get("key_modes")))
+        again = config_module.Config.load(TMP)
+        check("重新載入後模式還在",
+              again.effective_hotkeys() == ["RightCtrl", "F9@double", "F8@toggle"],
+              str(again.effective_hotkeys()))
+        check("TOML 裡的模式寫法可讀",
+              'hotkeys = ["RightCtrl", "F9@double", "F8@toggle"]'
+              in TMP.read_text(encoding="utf-8"))
+
+        print("  （認不得的模式要拒絕，不可靜默當成「按住說話」）")
+        st, body = post("/api/config", {"hotkeys": ["F9@dboule"]})
+        check("錯字模式回 400", st == 400, f"HTTP {st}")
+        check("訊息說得出是哪一個", "dboule" in str(body.get("error", "")),
+              str(body.get("error")))
+        check("原設定沒有被改壞",
+              cfg.effective_hotkeys() == ["RightCtrl", "F9@double", "F8@toggle"],
+              str(cfg.effective_hotkeys()))
+
+        print("\n[10] 開始／結束可以配對，而且**兩邊各有行為**（`F9,Esc@toggle`）")
+        st, body = post("/api/config",
+                        {"hotkeys": ["F9,Esc@toggle", "Ctrl+Alt+R,Space@double@toggle"]})
+        check("接受配對寫法", st == 200 and body.get("ok"), f"HTTP {st} {body}")
+        c = get("/api/config")
+        check("GET 原樣回傳配對",
+              c.get("hotkeys") == ["F9,Esc@toggle", "Ctrl+Alt+R,Space@double@toggle"],
+              str(c.get("hotkeys")))
+        check("兩邊的行為都拆得出來（UI 的兩個下拉各要一個）",
+              c.get("key_modes") == {
+                  "F9,Esc@toggle": {"start": "hold", "end": "toggle"},
+                  "Ctrl+Alt+R,Space@double@toggle": {"start": "double",
+                                                     "end": "toggle"}},
+              str(c.get("key_modes")))
+        check("舊欄位 hotkey 只留開始鍵",
+              c.get("hotkey") == "F9", str(c.get("hotkey")))
+        again = config_module.Config.load(TMP)
+        check("重新載入後配對還在",
+              again.effective_hotkeys() == ["F9,Esc@toggle",
+                                            "Ctrl+Alt+R,Space@double@toggle"],
+              str(again.effective_hotkeys()))
+        check("TOML 裡的配對寫法可讀",
+              'hotkeys = ["F9,Esc@toggle", "Ctrl+Alt+R,Space@double@toggle"]'
+              in TMP.read_text(encoding="utf-8"))
+
+        print("  （配對的**任一邊**打錯都要拒絕）")
+        for bad in ("F9,Banana", "Ctrl+Alt+R,F9,F8", "F9,Esc@dboule"):
+            st, body = post("/api/config", {"hotkeys": [bad]})
+            check(f"{bad} 回 400", st == 400, f"HTTP {st}")
+        check("原設定沒有被改壞",
+              cfg.effective_hotkeys() == ["F9,Esc@toggle",
+                                          "Ctrl+Alt+R,Space@double@toggle"],
+              str(cfg.effective_hotkeys()))
+        # 收尾：還原成後續測試期待的內容（[8] 讀 status）
+        post("/api/config", {"hotkeys": ["RightCtrl", "F9@double", "F8@toggle"]})
+
+        print("\n[8] /api/status 也要帶錄音鍵（狀態頁顯示「現在生效的是什麼」）")
+        st = get("/api/status")
+        check("status 有 hotkeys", st.get("hotkeys") == ["RightCtrl", "F9@double",
+                                                         "F8@toggle"],
+              str(st.get("hotkeys")))
+        check("沒有錯誤時 hotkey_warning 是 None", st.get("hotkey_warning") is None,
+              str(st.get("hotkey_warning")))
     finally:
         httpd.shutdown()
         TMP.unlink(missing_ok=True)

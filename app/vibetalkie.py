@@ -118,10 +118,21 @@ class Status:
                                   if daemon is not None else None),
                 # 麥克風優先順序與各自在不在線（主／副）
                 "mic_order": mic_order_status(self.cfg),
-                "hotkey": self.cfg.hotkey,
+                # 錄音鍵（**多組**）。`hotkey` 保留單一字串是為了相容舊 UI，
+                # 但真正的來源是 `hotkeys` 清單。
+                "hotkeys": list(self.cfg.effective_hotkeys()),
+                # 每一組的啟用狀態（順序與 hotkeys 一致）—— 停用的也列出來，
+                # 這樣狀態頁才能說「共 N 組，其中 M 組啟用中」。
+                "key_enabled": list(self.cfg.hotkey_enabled()),
+                "hotkey": (self.cfg.effective_hotkeys() or [""])[0],
+                "hotkeys_label": (getattr(daemon, "_hotkey_bindings", None).label
+                                  if getattr(daemon, "_hotkey_bindings", None) else ""),
                 "hotkey_label": (getattr(daemon, "_hotkey_spec", None).label
                                  if getattr(daemon, "_hotkey_spec", None) else ""),
                 "hotkey_error": getattr(daemon, "_hotkey_error", None) if daemon else None,
+                # 測試模式（只聽不錄）的狀態：UI 要顯示「有沒有收到那顆鍵」
+                "key_test": (daemon.test_state() if daemon is not None
+                             and hasattr(daemon, "test_state") else None),
                 "trigger_mode": self.cfg.trigger_mode,
                 # 執行期事實：這個行程的 tick 各跑了幾次。
                 # 「程式碼明明是對的，執行起來卻沒效果」時，這是最快的分辨方法 ——
@@ -158,9 +169,18 @@ class Status:
             "mic_device": d["mic_device"],
             "target_online": d["target_online"],
             "mic_order": d["mic_order"],
+            "hotkeys": d["hotkeys"],
+            "key_enabled": d["key_enabled"],
             "hotkey": d["hotkey"],
+            "hotkeys_label": d["hotkeys_label"],
             "hotkey_label": d["hotkey_label"],
+            # 錄音鍵設定有問題時一路傳到 UI 顯示 —— 設定頁寫了看不懂的字串
+            # 卻沒有任何提示，是最容易讓人白費一整輪的失敗模式。
+            "hotkey_warning": (f"錄音鍵設定有問題：{d['hotkey_error']}"
+                               if d["hotkey_error"] else None),
             "hotkey_error": d["hotkey_error"],
+            # 測試模式（只聽不錄）：UI 靠這個顯示「✓ 收到 F9」之類的回報
+            "key_test": d["key_test"],
             "trigger_mode": d["trigger_mode"],
             "ticks": d["ticks"],
             "model_wanted": d["model_wanted"],
@@ -176,6 +196,18 @@ class Status:
             "config_path": self.config_path,
             "opencc": self.opencc,
         }
+
+
+def start_key_text(entry: str) -> str:
+    """從一筆設定抽出「開始鍵」的寫法（去掉 `@模式` 與 `,結束鍵`）。
+
+    只有舊欄位 `hotkey` 需要這個 —— 它只認得單一顆鍵。
+    ⚠️ 順序：`F9,Esc@double` 要先切掉 `@模式` 再切 `,結束鍵`；
+    反過來的話 `F9,Esc@double` 會先被 `,` 切掉尾巴，卻留著 `@double`
+    （實測就是這個順序寫錯，舊欄位變成 `F9@double`）。
+    """
+    head = str(entry or "").split(hotkey.BINDING_SEP)[0]
+    return head.split(hotkey.MODE_SEP)[0].strip()
 
 
 # ---------------------------------------------------------------- 裝置解析
@@ -493,6 +525,8 @@ def make_handler(status: Status):
                 return self._model_action("cancel")
             if self.path == "/api/models/select":
                 return self._model_select()
+            if self.path == "/api/test-key":
+                return self._test_key()
             if self.path != "/api/config":
                 return self._json({"error": "unknown endpoint"}, 404)
             try:
@@ -525,14 +559,47 @@ def make_handler(status: Status):
             # 錄音鍵：**一定要能解析才存**。存進一個看不懂的字串，
             # 使用者會以為設定生效了，實際上還在用上一個鍵 ——
             # 這種「靜默退回」最難查。
-            if "hotkey" in patch:
-                spec_text = str(patch["hotkey"] or "").strip()
-                try:
-                    parsed = hotkey.parse(spec_text)
-                except hotkey.HotkeyError as exc:
-                    return self._json({"error": f"錄音鍵無法解析：{exc}"}, 400)
-                cfg.hotkey = spec_text
-                _ = parsed.label          # 供除錯用；解析成功才往下走
+            #
+            # ⚠️ 支援**多組**，而且每一組可以帶自己的觸發方式與結束鍵
+            # （`F9@double`、`F9,Escape`、`Ctrl+Alt+R,Escape@toggle`；
+            # 沒寫 `@` 就用全域 trigger_mode）。
+            # 也接受舊的單一字串 `hotkey`（舊版 UI／手寫的呼叫端）。
+            if "hotkeys" in patch or "hotkey" in patch:
+                raw = patch.get("hotkeys", None)
+                if raw is None:
+                    one = str(patch.get("hotkey") or "").strip()
+                    raw = [one] if one else []
+                if not isinstance(raw, list):
+                    return self._json({"error": "hotkeys 必須是陣列（例如 "
+                                                '["RightCtrl", "F9,Escape"]）'}, 400)
+                keys: list[str] = []
+                seen: list = []
+                for item in raw:
+                    text = str(item or "").strip()
+                    if not text:
+                        continue
+                    try:
+                        # 驗證開始鍵、結束鍵**與兩邊的行為**；生效由 daemon 解析
+                        spec, _smode, _end, _emode = hotkey.parse_binding(
+                            text, cfg.trigger_mode)
+                    except hotkey.HotkeyError as exc:
+                        return self._json({"error": f"錄音鍵無法解析：{exc}"}, 400)
+                    # ⚠️ 去重要比**解析後**的規格，不是原始字串：`F9` 與 `f9`
+                    # 是同一組，`Ctrl+Alt+R` 與 `ctrl-alt-r` 也是。只比字串
+                    # 的話清單裡會出現兩個看起來一樣、其實重複的鍵，
+                    # 而 UI 的「已經在清單裡了」判斷也會失效。
+                    if any(spec == s for s in seen):
+                        continue
+                    seen.append(spec)
+                    keys.append(text)
+                # ⚠️ 空清單是**拒絕**而不是「等於沒設」。接受的話會變成
+                # 「一個錄音鍵都沒有」→ 使用者按什麼都不會錄音，
+                # 而且畫面上看起來儲存成功了。
+                if not keys:
+                    return self._json({"error": "至少要有一個錄音鍵"}, 400)
+                cfg.hotkeys = keys
+                # 兼容舊欄位：只留**開始鍵**（去掉 `@模式` 與 `,結束鍵`）
+                cfg.hotkey = start_key_text(keys[0])
 
             if "trigger_mode" in patch:
                 val = str(patch["trigger_mode"])
@@ -595,6 +662,32 @@ def make_handler(status: Status):
             # 被拒絕的請求不該回 200。實測踩過：路徑跳脫的名稱回 200 + 「名稱不合法」，
             # 語意上等於「成功但訊息很奇怪」，讓呼叫端很難判斷。
             return self._json({"ok": ok, "message": msg}, 200 if ok else 400)
+
+        def _test_key(self):
+            """測試某個組合：聽按鍵、回報結果，**不錄音也不注入**。
+
+            為什麼需要：設定好之後，驗證方式只有「按下去看有沒有反應」，
+            但那會真的開始錄音、把文字注入使用者正在打的地方。
+            這裡提供一個沒有副作用的驗證路徑（實測回饋：「除了沒有測試之外…」）。
+            """
+            daemon = status.daemon
+            if daemon is None or not hasattr(daemon, "start_key_test"):
+                return self._json({"ok": False,
+                                   "message": "常駐程式未啟動（用 app/ 的介面才有）"},
+                                  503)
+            try:
+                body = self._body()
+            except Exception as exc:
+                return self._json({"ok": False, "message": f"bad json: {exc}"}, 400)
+            if body.get("cancel"):
+                daemon.cancel_key_test()
+                return self._json({"ok": True, "cancelled": True})
+            try:
+                secs = float(body.get("seconds") or 20.0)
+            except (TypeError, ValueError):
+                return self._json({"ok": False, "message": "seconds 必須是數字"}, 400)
+            res = daemon.start_key_test(secs, str(body.get("which") or ""))
+            return self._json(res)
 
         def _model_select(self):
             mgr = status.models

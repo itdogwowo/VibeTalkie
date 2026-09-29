@@ -14,6 +14,8 @@ import tomllib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+import hotkey   # 觸發方式的格式（`@` 分隔）只有一處定義，見 app/core/hotkey.py
+
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config.toml"
 EXAMPLE_PATH = ROOT / "config.example.toml"
@@ -28,23 +30,30 @@ DEFAULT_MODEL_DIR = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 #   就把那句寫進選項說明。**使用者一測就推翻了** —— 他選 session 之後
 #   零中斷、而且整段都聽得到聲音。端點狀態會騙人，**聽感才是事實**。
 #
-# 目前的事實（使用者實測，兩次一致）：
-#   · per_press    每按一次開一次串流 → 每段錄音斷一次（耳機重連約 6–8 秒）
-#   · session      串流從第一次按下就一直開著 → **零中斷，且聲音不受影響**
-#   · idle_timeout 放開後等逾時才關 → 每段錄音仍會斷（除非句間停頓短於逾時）
+# ⚠️ 2026-09 再修正：`per_press` 原本是「按下才開串流、放開就關」，
+#   實測結果是**每次按下都要重新協商 SCO**，所以第一段幾乎一定
+#   `音訊 0.00s`（使用者：「第一段錄音經常無法成功」）。
+#   現在三種模式的差別只剩「串流開著多久」：
+#     · 不按下時也開著（待命）→ 第一次按下立刻有音
+#   `per_press` 與 `session` 在待命期間**看起來一樣**，差別是前者
+#   放開後會把串流關掉（下次按下要重新協商，但至少暖機做過了）。
+#   若實測發現還是不夠，就該把 `per_press` 的說明再改一次 —— 以實測為準。
 MIC_STREAM_OPTIONS: list[dict] = [
     {
         "value": "per_press",
         "label": "每次按下才開（預設）",
-        "note": "每次錄音都會讓藍牙耳機的播放斷一次（實測重連要 6–8 秒）。"
-                "只有在「不想讓程式一直佔著麥克風」時才選這個。",
+        "note": "放開之後會把麥克風串流關掉，下次按下重新開啟。"
+                "⚠️ 已修正：程式啟動時會先暖機，所以第一次按下不會再拿到空音訊。"
+                "只有在「不想讓程式一直佔著麥克風」時才選這個 —— "
+                "它的缺點是每段錄音之間藍牙耳機的播放會被斷一次。",
     },
     {
         "value": "session",
         "label": "開著不關（建議：零中斷）★",
-        "note": "第一次按下之後麥克風串流就一直開著，之後每段錄音都不會再中斷，"
-                "而且播放正常。實測（使用者聽感 + 端點監看各兩次）：零中斷、"
-                "聲音全程都在。缺點是麥克風一直處於開啟狀態。",
+        "note": "麥克風串流從啟動就一直開著，每段錄音之間都不會中斷，播放正常。"
+                "實測（使用者聽感 + 端點監看各兩次）：零中斷、聲音全程都在；"
+                "另外實測確認待命期間音訊持續進來（`tools/p1/measure_standby_audio.py`），"
+                "所以第一段錄音一定錄得到。缺點是麥克風一直處於開啟狀態。",
     },
     {
         "value": "idle_timeout",
@@ -70,6 +79,10 @@ IDLE_TIMEOUT_MAX = 120.0
 #
 # 為什麼要做成選項：裝置原生是「按住說話」（hold），但使用者要能完全脫離硬體 ——
 # 用鍵盤時，`hold` 會跟「按住某個鍵做別的事」衝突，所以需要其他方式。
+#
+# ⚠️ 這裡是**全域預設值**，不是唯一開關。正式來源是 `hotkeys` 清單裡每一組
+# 自己的模式（`F9@double`）。為什麼：實測回饋「無法錄製雙擊」——
+# 真實情境是「藍牙麥克風按住說話 ＋ 鍵盤 F9 雙擊」，兩者必須並存。
 TRIGGER_MODES: list[dict] = [
     {
         "value": "hold",
@@ -80,13 +93,14 @@ TRIGGER_MODES: list[dict] = [
     {
         "value": "toggle",
         "label": "按一下開始／再按一下停止",
-        "note": "不必一直按著。適合講長句，或鍵盤上不好長時間按住的鍵。",
+        "note": "按一下開始錄音，**再按一下同一個鍵結束**。"
+                "不必一直按著。適合講長句，或鍵盤上不好長時間按住的鍵。",
     },
     {
         "value": "double",
         "label": "雙擊（模仿 macOS）",
-        "note": f"快速連按兩下開始錄音，再連按兩下停止。"
-                f"與其他操作最不衝突 —— 單擊不會觸發。",
+        "note": "快速連按兩下開始錄音，**再連按兩下結束** —— 開始與結束是"
+                "同一個手勢，不必記兩種操作。與其他操作最不衝突（單擊不會觸發）。",
     },
 ]
 
@@ -97,6 +111,14 @@ TRIGGER_MODES_VALUES = tuple(o["value"] for o in TRIGGER_MODES)
 HOTKEY_PRESETS: list[str] = [
     "RightCtrl", "LeftCtrl", "F8", "F9", "F10", "ScrollLock", "Pause",
     "Ctrl+Alt+R", "Ctrl+Shift+Space", "Alt+`",
+]
+
+# 「結束鍵」選單的候選。為什麼跟開始鍵分開一組：
+# 結束鍵最常按的是「不會輸入字元、又順手」的鍵（Escape／Enter／F 系列），
+# 而且它只需要**單一顆鍵**就夠用（組合鍵當結束鍵反而難按）。
+HOTKEY_END_PRESETS: list[str] = [
+    "Esc", "Enter", "Space", "F8", "F9", "F10", "ScrollLock", "Pause",
+    "RightCtrl", "LeftCtrl",
 ]
 
 
@@ -112,9 +134,17 @@ class Config:
     mic_names: list = field(default_factory=list)
 
     # [trigger] 錄音鍵（可完全自訂，不必綁任何硬體）
-    hotkey: str = "RightCtrl"           # 例如 RightCtrl / F9 / Ctrl+Alt+R
+    #
+    # ⚠️ 為什麼是**清單**：實測回饋 —— 只設一個鍵不夠用。
+    # 藍牙麥克風的 RightCtrl 與鍵盤上的 F9 常常要並存（在家／外出、
+    # 裝置休眠時），使用者不該為了換鍵進設定頁改來改去。
+    hotkeys: list = field(default_factory=list)   # 正式來源，例如 ["RightCtrl","F9@double"]
+    hotkey: str = "RightCtrl"           # 舊欄位；只在 hotkeys 為空時當後備
     # 觸發方式：hold＝按住說話、toggle＝按一下開始再按一下停、
     #           double＝雙擊（模仿 macOS 的聽寫快捷鍵）
+    # ⚠️ **全域預設值**：清單裡某一組沒寫 `@模式` 時才用它。
+    # 每一組自己的模式寫在 `hotkeys` 裡（`F9@double`），因為
+    # 「麥克風按住說話 ＋ 鍵盤雙擊」這種組合是常態，全域一個值做不到。
     trigger_mode: str = "hold"
     double_tap_ms: int = 400            # double 模式的兩下間隔上限
 
@@ -187,8 +217,8 @@ class Config:
         d = asdict(self)
         d.pop("extra", None)
         sections = {
-            "device": ("device_index", "mic_name", "mic_names", "hotkey",
-                       "trigger_mode", "double_tap_ms"),
+            "device": ("device_index", "mic_name", "mic_names",
+                       "hotkeys", "hotkey", "trigger_mode", "double_tap_ms"),
             "asr": ("engine", "model_dir", "language", "threads"),
             "output": ("mode", "traditional", "restore_clipboard",
                        "remove_trailing_period"),
@@ -215,11 +245,21 @@ class Config:
             "mic_name": self.mic_name,
             "mic_names": list(self.mic_names or []),
             "mic_order": self.effective_mic_order(),
-            "hotkey": self.hotkey,
+            "hotkeys": self.effective_hotkeys(),
+            # 舊欄位：**只給開始鍵**（不含 `@模式` 與 `,結束鍵`）——
+            # 它只認得單一顆鍵，塞整筆進去的話舊程式會解析失敗。
+            "hotkey": self.effective_start_key(),
             "trigger_mode": self.trigger_mode,
             "double_tap_ms": self.double_tap_ms,
             "trigger_modes": TRIGGER_MODES,
+            # 每一組的觸發方式（`{規格字串: 模式}`）—— UI 要畫「按住/切換/雙擊」
+            # 這排 chips，不想自己揣測 `@模式` 的格式，所以由後端拆好給它。
+            "key_modes": self.hotkey_modes(),
+            # 每一組的**啟用狀態**（停用的帶 `~` 前綴）。
+            # UI 要顯示「N 組生效中」與開關狀態，不想自己切 `~`。
+            "key_enabled": self.hotkey_enabled(),
             "hotkey_presets": HOTKEY_PRESETS,
+            "hotkey_end_presets": HOTKEY_END_PRESETS,
             "mode": self.mode,
             "traditional": self.traditional,
             "remove_trailing_period": self.remove_trailing_period,
@@ -241,6 +281,62 @@ class Config:
         if names:
             return names
         return [self.mic_name] if (self.mic_name or "").strip() else []
+
+    def effective_hotkeys(self) -> list:
+        """實際要用的錄音鍵清單。
+
+        新舊欄位並存的關係（和麥克風同一套路）：`hotkeys` 是正式來源；
+        空的就退回舊的單一字串 `hotkey`。舊設定檔因此不必遷移。
+
+        每一筆可以帶觸發方式：`"F9@double"`（沒寫就是全域 `trigger_mode`）。
+        """
+        keys = [k for k in (self.hotkeys or []) if str(k or "").strip()]
+        if keys:
+            return keys
+        return [self.hotkey] if (self.hotkey or "").strip() else []
+
+    def effective_start_key(self) -> str:
+        """第一組的**開始鍵**寫法（給舊欄位 `hotkey` 用）。
+
+        ⚠️ 一定要去掉 `@模式` 與 `,結束鍵`：舊欄位只認得單一顆鍵，
+        塞整筆 `"F9,Esc@double"` 進去，舊程式與文件都會看到看不懂的字串。
+        """
+        keys = self.effective_hotkeys()
+        if not keys:
+            return ""
+        head = str(keys[0]).split(hotkey.BINDING_SEP)[0]   # 先切掉結束鍵
+        return head.split(hotkey.MODE_SEP)[0].strip()      # 再切掉模式
+
+    def hotkey_enabled(self) -> list:
+        """每一組是否啟用（順序與 `effective_hotkeys()` 一致）。
+
+        `~` 前綴＝停用（見 `app/core/hotkey.py` 的 `DISABLED_PREFIX`）。
+        為什麼由後端算：那是 hotkey 模組的知識，UI 不該自己切字串。
+        """
+        return [not str(k).strip().startswith(hotkey.DISABLED_PREFIX)
+                for k in self.effective_hotkeys()]
+
+    def hotkey_modes(self) -> dict:
+        """每一組的**兩邊行為**：`{"F9,Esc@toggle": {"start": "hold", "end": "toggle"}}`。
+
+        ⚠️ 為什麼由後端拆好：`@行為`、`,` 配對的格式是
+        `app/core/hotkey.py` 的知識，UI 不該自己切字串 ——
+        兩邊各切一次就是漂移的開始（實際踩過好幾次）。
+        UI 的兩個下拉各自要一個值，所以這裡一次給兩邊。
+        """
+        out = {}
+        for entry in self.effective_hotkeys():
+            text = str(entry).strip()
+            if not text:
+                continue
+            try:
+                _s, start, _e, end = hotkey.parse_binding(text, self.trigger_mode)
+                out[text] = {"start": start, "end": end}
+            except hotkey.HotkeyError:
+                # 壞掉的字串由 daemon 回報（UI 會顯示 hotkey_warning），
+                # 這裡先給一組安全的預設值，不要讓 UI 拿到 None。
+                out[text] = {"start": self.trigger_mode, "end": ""}
+        return out
 
 
 def _toml_value(v) -> str:
@@ -265,6 +361,9 @@ EXAMPLE = """\
 [device]
 device_index = 1
 mic_name = ""
+# 錄音鍵可以有很多個（按鍵來源完全自訂，不必綁硬體）。
+# 想用鍵盤錄音就填一個不是裝置原生的鍵，例如 F9。
+hotkeys = ["RightCtrl"]
 hotkey = "RightCtrl"
 
 [asr]

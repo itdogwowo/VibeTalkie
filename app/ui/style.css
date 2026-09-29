@@ -147,3 +147,62 @@ button.sm{padding:6px 12px;font-size:12.5px}
 .pbar{height:5px;background:var(--panel2);border-radius:3px;overflow:hidden;
       margin-top:8px;width:100%}
 .pbar i{display:block;height:100%;background:var(--accent);transition:width .2s}
+
+/* 錄音鍵的「錄製」面板：按下實體按鍵時，這裡要**很明顯**在等輸入 ——
+ * 否則使用者會以為按了沒反應，然後去按第二次（第二次才是被錄到的那顆）。 */
+.hotkeyrec{
+  width:100%;border:1px dashed var(--accent);border-radius:10px;
+  background:rgba(79,156,249,.08);padding:12px 14px;
+}
+.hotkeyrec.on{border-style:solid;animation:pulse 1.4s infinite}
+.hotkeyrec .t{font-weight:600}
+.hotkeyrec .n{color:var(--dim);font-size:12px;line-height:1.6;margin-top:4px}
+.hotkeyrec .captured{font-size:15px;margin-top:6px}
+/* 剛加入清單的那一列閃一下，讓使用者知道「就是這個」 */
+.modeopt.flash{animation:flash 1.1s ease-out 1}
+@keyframes flash{
+  0%{border-color:var(--ok);background:rgba(63,185,80,.18)}
+  100%{border-color:var(--accent);background:var(--panel2)}
+}
+
+/* 每一列錄音鍵的觸發方式：三個小按鈕（按住說話／按一下切換／雙擊）。
+ * 選中的那個要一眼看得出來 —— 否則使用者會以為「設定沒生效」。 */
+.modechip{padding:3px 8px;font-size:11.5px;font-weight:500;color:var(--dim);
+  border-radius:99px}
+.modechip:hover{color:var(--fg)}
+.modechip.on{background:rgba(79,156,249,.16);border-color:var(--accent);
+  color:var(--accent);font-weight:600}
+
+/* ---- 一列錄音鍵＝兩個區域：開始 | 結束 ----
+ * 為什麼是格子而不是 flex 換行：使用者要的是「同一行分兩個區域分開錄製」，
+ * 對齊的格子才看得出來「這一格是開始、那一格是結束」，換行排版會糊在一起。
+ * 兩邊各自有自己的行為下拉（開始＝怎麼開始；結束＝鬆開／再按一下／連按兩下）。 */
+.hkrow{display:grid;grid-template-columns:1fr 1fr auto;gap:0;
+  padding:0;overflow:hidden}
+.hkcell{padding:10px 12px;border-right:1px solid var(--line);min-width:0}
+.hkcell:last-child{border-right:0}
+.hkcell-ops{display:flex;flex-direction:column;gap:5px;justify-content:center;
+  padding:10px 10px}
+.hkhead{color:var(--dim);font-size:11px;margin-bottom:5px;display:flex;
+  align-items:center;gap:6px}
+.hkval{font-size:14px;word-break:break-all;margin-bottom:7px}
+.hkval.dim{color:var(--dim);font-size:12.5px}
+.hkacts{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-bottom:5px}
+.hkacts select{min-width:0;flex:1;padding:4px 6px;font-size:12px}
+.hkacts-mode{margin-bottom:0}
+.hklabel{color:var(--dim);font-size:11.5px;flex:0 0 auto}
+/* 停用的那一列要**看得出來**（但不要消失 —— 設定還在，只是不觸發） */
+.hkrow.off{opacity:.55}
+.hkrow.off .hkval{text-decoration:line-through}
+/* 表頭裡的啟用開關與測試鈕 */
+.hksw{margin-left:auto;font-size:11px;gap:5px}
+.hksw input{width:14px;height:14px}
+.hktest{flex:0 0 auto;padding:2px 8px;font-size:11px}
+
+/* 窄螢幕：兩個區域改成上下堆疊（不然每一格都擠成一團） */
+@media (max-width:760px){
+  .hkrow{grid-template-columns:1fr}
+  .hkcell{border-right:0;border-bottom:1px solid var(--line)}
+  .hkcell-ops{flex-direction:row;border-bottom:0}
+}
+

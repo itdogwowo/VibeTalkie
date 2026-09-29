@@ -53,14 +53,14 @@
       <div class="row"><span class="k">設定的麥克風</span>
         <span class="v" id="target-online">—</span></div>
       <div class="hint" style="margin:0">
-        這裡顯示的是**程式現在真正在做的**，不是設定頁裡選的。<br>
-        · <span class="kv">session</span>：按過一次之後「開著」會**一直維持是**<br>
+        這裡顯示的是<b>程式現在真正在做的</b>，不是設定頁裡選的。<br>
+        · <span class="kv">session</span>：按過一次之後「開著」會<b>一直維持是</b><br>
         · <span class="kv">idle_timeout</span>：放開後維持「開著」，直到逾時才變「已關閉」<br>
         · <span class="kv">per_press</span>：平時都是「已關閉」，只有錄音時是「開著」<br>
         若模型顯示「（設定要 X，實際跑 Y）」，代表設定還沒生效 ——
         回設定頁按「儲存設定」，或重啟程式。<br>
-        「設定的麥克風」若顯示**離線**，代表它進省電休眠了（藍牙閒置常見）——
-        程式會先沿用其他麥克風，等它醒來會**自動切回**，不必手動處理。
+        「設定的麥克風」若顯示<b>離線</b>，代表它進省電休眠了（藍牙閒置常見）——
+        程式會先沿用其他麥克風，等它醒來會<b>自動切回</b>，不必手動處理。
       </div>
     </div>
 
@@ -92,7 +92,7 @@
         <span class="k" style="color:var(--warn,#d9534f)">設定未生效</span>
         <span class="v" id="m-mismatch" style="color:var(--warn,#d9534f)">—</span></div>
       <div class="hint" style="margin:0">
-        這一行顯示的是**引擎實際載入的模型**。切換後它應該立刻跟著變；<br>
+        這一行顯示的是<b>引擎實際載入的模型</b>。切換後它應該立刻跟著變；<br>
         若沒變（或上面出現紅字），代表切換沒有真正生效 —— 重新整理頁面再試一次。
       </div>
     </div>
@@ -125,10 +125,13 @@
         <div id="micorder" style="width:100%"></div>
         <div style="display:flex;gap:8px;align-items:center;width:100%">
           <select id="micadd" style="flex:1"></select>
-          <button class="ghost sm" id="micadd-btn">加入</button>
+          <button class="ghost sm" id="micadd-btn" disabled>加入清單</button>
         </div>
+        <div class="hint" id="micnote" style="margin:0;color:var(--ok)"></div>
       </div>
       <div class="hint" style="margin:8px 0 0">
+        上面的<b>方框是「已經在用的」</b>麥克風；下面那一行只是<b>挑選器</b> ——
+        先從下拉選一支，再按「加入清單」才會加進去。<br>
         主麥克風不在線時（藍牙省電休眠、拔掉）會自動用下一順位，
         它回來就自動換回 —— 不必手動切換。<br>
         <b>「按鍵」與「麥克風」是分開的</b>：你可以按藍牙麥克風的鍵、聲音從 USB 進來。
@@ -137,27 +140,25 @@
 
     <div class="card">
       <h2>錄音鍵與觸發方式</h2>
-      <div class="row">
-        <span class="k">錄音鍵</span>
-        <input type="text" id="hotkey" list="hotkey-list" placeholder="例如 RightCtrl / F9 / Ctrl+Alt+R"
-               style="min-width:220px">
-        <datalist id="hotkey-list"></datalist>
-      </div>
-      <div class="hint" style="margin:4px 0 10px">
-        可以填任何鍵或組合鍵。填**不是裝置原生的鍵**（例如 F9）就完全脫離硬體 ——
-        用鍵盤也能錄音。<br>
-        語法：<span class="kv">Ctrl+Alt+R</span>、<span class="kv">F9</span>、
-        <span class="kv">Ctrl+Shift+Space</span>、<span class="kv">Alt+`</span>；
-        修飾鍵順序不拘，<span class="kv">ctrl-alt-r</span> 也認。
-      </div>
       <div class="row" style="align-items:flex-start;flex-direction:column;gap:8px">
-        <span class="k">觸發方式</span>
-        <div id="triggermode" style="width:100%"></div>
+        <span class="k">錄音鍵（可以有<b>好幾個</b>，每個自己的觸發方式）</span>
+        <div id="hotkeys" style="width:100%"></div>
+        <div style="display:flex;gap:8px;align-items:center;width:100%;flex-wrap:wrap">
+          <button id="hotkey-record">🎧 錄製按鍵</button>
+          <span class="kv" style="color:var(--dim)">按下去之後直接按你要用的那顆鍵</span>
+        </div>
+        <div id="hotkey-rec" class="hotkeyrec" style="display:none"></div>
+      </div>      <div class="hint" style="margin:4px 0 10px">
+        每一列是**一組配對**，只有兩個區域，<b>各自獨立錄製、各自的「行為」下拉</b>：<br>
+        · <b>開始</b>：按「🎧 錄製」直接按一次那顆鍵，或從下拉選單挑；
+        行為可選 <b>按一下開始</b>／<b>連按兩下開始</b><br>
+        · <b>結束</b>：可以是<b>另一顆鍵</b>（例如開始用藍牙麥克風的 RightCtrl、
+        結束用鍵盤的 Esc），行為可選 <b>鬆開才停</b>／<b>再按一下停</b>／
+        <b>連按兩下停</b>；留「沒有」就是放開開始鍵就停<br>
+        兩邊的行為互不影響。多組之間是「<b>或</b>」的關係 ——
+        任何一組都能開始錄音。
       </div>
-      <div class="hint" id="dblrow" style="display:none;margin:8px 0 0">
-        連按兩下的間隔上限
-        <input type="number" id="dblms" min="150" max="1000" step="50" style="width:80px"> ms
-      </div>
+      <div class="hint" id="hotkey-status" style="margin:8px 0 0"></div>
     </div>
 
     <div class="card">
@@ -181,6 +182,8 @@
         「句號」有多種寫法（<span class="kv">。．.｡</span>），全部都會移除；
         只處理結尾，不動句中的標點。
       </div>
+    </div>
+
     <div class="card">
       <h2>藍牙干擾</h2>
       <div class="hint" style="margin:0 0 12px">
@@ -194,7 +197,7 @@
         <input type="number" id="idlesecs" min="5" max="120" step="1" style="width:80px">
       </div>
       <div class="hint" id="idlehint" style="display:none;margin:0 0 10px">
-        ⚠️ 這個值**必須比你講話時的停頓長**，否則每次放開都會斷一次，
+        ⚠️ 這個值<b>必須比你講話時的停頓長</b>，否則每次放開都會斷一次，
         就等同「每次按下才開」了。實測 2 秒太短（等於沒有效果），
         一般交談建議 <span class="kv">8–15 秒</span>；最短只接受 5 秒。
       </div>
@@ -217,11 +220,11 @@
         <span class="kv" id="saved" style="color:var(--ok)"></span>
       </div>
       <div class="hint" style="margin:12px 0 0">
-        按「儲存設定」會**立即生效，不需要重啟**。<br>
-        ⚠️ 若你改成**直接編輯 <span class="kv">config.toml</span>**，
+        按「儲存設定」會<b>立即生效，不需要重啟</b>。<br>
+        ⚠️ 若你改成<b>直接編輯 <span class="kv">config.toml</span></b>，
         存檔後也會生效（程式會偵測檔案變動）。但要注意：之後只要按一次
         「儲存設定」，就會用這一頁顯示的值把檔案覆蓋掉。<br>
-        → 不確定現在跑哪個模式，看**狀態頁的「藍牙干擾模式（目前生效中）」**。
+        → 不確定現在跑哪個模式，看<b>狀態頁的「麥克風串流」那一行</b>。
       </div>
     </div>
   </section>

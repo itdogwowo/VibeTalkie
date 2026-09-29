@@ -104,6 +104,15 @@ class Cfg:
         self.traditional = True
         self.remove_trailing_period = True
         self.mode = "auto"
+        # 錄音鍵：不給的話 `_live()` 會拿到空清單，每次都比對失敗並印警告
+        # （測試輸出會被那些警告洗掉）。這裡給預設值，跟真實 Config 一致。
+        self.hotkeys = ["RightCtrl"]
+        self.hotkey = "RightCtrl"
+        self.trigger_mode = "hold"
+        self.double_tap_ms = 400
+
+    def effective_hotkeys(self) -> list:
+        return list(self.hotkeys or ([self.hotkey] if self.hotkey else []))
 
 
 def make_daemon(mic_stream: str, idle_timeout_s: float = 7.0):
@@ -605,6 +614,153 @@ def test_buffer_recycle() -> None:
           f"closed={cap.closed} _cap={d._cap!r}")
 
 
+def test_warm_standby() -> None:
+    """⚠️ 串流要「暖機待命」—— 第一次按下不能是特例（實測回饋修正）。
+
+    實際踩到：`per_press` 原本是「按下才開、放開就關」，於是**每次按下都要
+    重新協商 SCO**，第一段幾乎一定 `音訊 0.00s`。使用者連續抱怨兩次
+    （「經常第一段錄音無法錄製」）。
+
+    現在改成：串流一直開著待命、待命期間維護前捲（`_PREROLL_S`），
+    按下時連前捲一起交給辨識。這支測試釘住「暖機完串流還在」與
+    「第一次按下就有音」兩件事。
+    """
+    print("\n[13] 暖機待命：暖機完串流要留著（第一次按下不能是特例）")
+    for mode in ("per_press", "session"):
+        d = make_daemon(mode)
+        # 放開時會走辨識 → 給一個最小引擎，否則會炸在 engine=None
+        class _Engine:
+            model_dir = "x"
+            def transcribe(self, samples, rate):
+                class R:
+                    text = "測試"
+                return R()
+        d.engine = _Engine()
+        FakeCapture.instances.clear()
+        # 先讓「驅動程式」有資料，暖機才會在時限內判定成功
+        first = None
+
+        class _WarmupCap(FakeCapture):
+            def __enter__(self):
+                super().__enter__()
+                self.feed(16000)            # 一開就有音 → 暖機立刻成功
+                return self
+
+        orig = ptt_mod.Capture
+        ptt_mod.Capture = _WarmupCap
+        try:
+            first = d.warmup_audio(2.0)
+        finally:
+            ptt_mod.Capture = orig
+        cap = d._cap
+        check(f"[{mode}] 暖機後串流仍開著（待命）", cap is not None and cap.opened,
+              f"_cap={cap!r}")
+        check(f"[{mode}] warmup 回報首音延遲", first is not None, str(first))
+
+        # 待命：餵 0.3 秒的音訊 → 應該進前捲，**不是**錄音
+        cap.feed(int(16000 * 0.3) * 2)
+        d._tick_capture()
+        check(f"[{mode}] 待命期間進前捲（不當成錄音）",
+              len(d._preroll) == d._preroll_bytes and len(d._rec_pcm) == 0,
+              f"preroll={len(d._preroll)} rec={len(d._rec_pcm)}")
+
+        # 按下 → 立刻有前捲那一段（＝第一次按下不必等 SCO）
+        d._start_recording("t")
+        check(f"[{mode}] 第一次按下立刻有音（前捲）",
+              len(d._rec_pcm) == d._preroll_bytes, str(len(d._rec_pcm)))
+
+        # 錄音中：新音訊接在後面
+        cap.feed(16000 * 2)                 # 0.5 秒
+        d._tick_capture()
+        check(f"[{mode}] 錄音中的新音訊接在前捲後面",
+              len(d._rec_pcm) == d._preroll_bytes + 32000, str(len(d._rec_pcm)))
+        d._finish_recording()
+        check(f"[{mode}] 放開後回到待命（串流沒被關掉）", d._cap is cap)
+        check(f"[{mode}] 錄音緩衝清空（下一段不會摻到上一段）",
+              len(d._rec_pcm) == 0, str(len(d._rec_pcm)))
+
+    print("  （前捲長度要合理：太長會把環境音塞進辨識開頭）")
+    check("前捲 0.1–0.5 秒之間",
+          0.1 <= ptt_mod.PttDaemon._PREROLL_S <= 0.5,
+          str(ptt_mod.PttDaemon._PREROLL_S))
+
+
+def press_key(d, down: bool, vk: int = 0xA3, e0: bool = True) -> None:
+    """餵一個假的 Raw Input 事件（跟 test_trigger 同一招）。"""
+    class _KB:
+        def __init__(self):
+            self.VKey = vk
+            self.Message = 0x0100 if down else 0x0101
+            self.Flags = 0x02 if e0 else 0
+            self.MakeCode = 0
+    d._handle_key(1, _KB())
+
+
+def test_device_switch() -> None:
+    """⚠️ 裝置換了（藍牙休眠回來）→ 前捲要清掉，而且不能只拿到舊前捲。
+
+    實測症狀（使用者 log）：
+
+        目標麥克風離線（省電休眠？）→ 已重新上線 → 下次錄音會用它（device 0）
+        🔴 錄音中…
+        ⏹  停止（2.6s，音訊 0.25s）      ← 0.25 秒＝前捲
+        ⚠️ 沒有辨識出文字（22 ms）
+
+    原因：裝置從 1 換到 0 時重開了串流，但
+      · 前捲還是**舊裝置**的音訊（沒清掉）
+      · 新串流還沒開始送音訊，所以 `_rec_pcm` 只有那 0.25 秒
+      · 然後被當成「太短」→ 沒有辨識，使用者只看到「按了沒反應」
+    """
+    print("\n[14] 換裝置（藍牙休眠回來）：前捲要清掉，串流要重開")
+    d = make_daemon("session")
+    cur = {"dev": 1}
+    d.device_provider = lambda: cur["dev"]
+
+    class _E:
+        model_dir = "x"
+        def transcribe(self, samples, rate):
+            class R:
+                text = "測試"
+            return R()
+    d.engine = _E()
+    FakeCapture.instances.clear()
+
+    d._ensure_capture()
+    first = d._cap
+    first.feed(16000)                       # 舊裝置送了一些音（會進前捲）
+    d._tick_capture()
+    check("舊裝置的前捲有內容", len(d._preroll) > 0, str(len(d._preroll)))
+
+    print("  （裝置變成 0 → `_ensure_capture` 應該關舊的、開新的、清前捲）")
+    cur["dev"] = 0
+    d._ensure_capture()
+    check("換了一支裝置（新物件、device 0）",
+          d._cap is not first and d._cap.device_id == 0,
+          f"{first.device_id} → {getattr(d._cap, 'device_id', None)}")
+    check("舊裝置被關掉", first.closed)
+    check("**前捲被清空**（不然會混進另一支麥克風的聲音）",
+          d._preroll == b"", str(len(d._preroll)))
+
+    print("  （切換後馬上按下：新串流來不及送音 → 不能只拿舊前捲就說「太短」）")
+    before = len(FakeCapture.instances)
+
+    class _E2(_E):
+        def transcribe(self, samples, rate):
+            return super().transcribe(samples, rate)
+    d.engine = _E2()
+
+    # 完整的一次按鍵（按下 → 放開）—— 只呼叫 `_finish_recording()` 的話
+    # `_retry_armed` 不會被武裝（那是 `_on_main_down` 的工作），測不到重試。
+    press_key(d, True)
+    check("切換後按下時沒有可用的音訊（前捲已清）", len(d._rec_pcm) == 0,
+          str(len(d._rec_pcm)))
+    press_key(d, False)                     # 0 秒 → 走「暖機寬限」那條路
+    check("暖機寬限期內自動重開串流（而不是當成誤觸丟掉）",
+          len(FakeCapture.instances) > before,
+          f"{before} → {len(FakeCapture.instances)}")
+    check("重試有記在 stats", d.stats.get("retried", 0) >= 1, str(d.stats))
+
+
 def main() -> int:
     print("=" * 70)
     print("麥克風串流模式測試")
@@ -623,6 +779,8 @@ def main() -> int:
     test_device_reclaim_on_wake()
     test_no_config_thrash()
     test_buffer_recycle()
+    test_warm_standby()
+    test_device_switch()
 
     print("\n" + "=" * 70)
     if failures:
