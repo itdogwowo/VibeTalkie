@@ -78,6 +78,7 @@ VibeTalkie/
 │  ├─ core/               # ★ 執行期模組（產品依賴，**不是工具**）
 │  │  ├─ speech_engine.py #   ASR 引擎（sherpa-onnx，多模型家族）
 │  │  ├─ hotkey.py        #   錄音鍵規格解析（**多組**：RightCtrl / F9 / Ctrl+Alt+R）
+│  │  ├─ trigger.py       #   ★ **平台無關的觸發狀態機**（兩個平台共用同一顆）
 │  │  ├─ ptt.py           #   PTT 常駐：Raw Input → 錄音 → 辨識 → 注入
 │  │  ├─ recorder.py      #   擷取封裝（自動停止、音量分析）
 │  │  ├─ record_wav.py    #   winmm waveIn 底層
@@ -173,8 +174,22 @@ IDLE ──press──> RECORDING ──release──> PROCESSING ──ok──
 | `vad` | 頭尾靜音修剪（保留前後 300 ms） | 不決定何時開始錄（按鍵決定） |
 | `asr` | 音訊 → 文字（含標點） | 不改寫語意 |
 | `textin` | 剪貼簿貼上 → 失敗則逐字輸入 | 不產生文字 |
-| `hotkey` | 全域按鍵按下／放開 | 不錄音 |
+| `hotkey` | 按鍵**規格**的解析與比對（名稱／側別／多組綁定） | 不維護觸發狀態 |
+| `trigger` | 按鍵**事件** → 開始／停止的決策（多組命中／雙邊行為／停用／測試模式） | 不碰音訊、不碰平台 API |
 | `config` | TOML 讀寫（serde） | 不驗證業務邏輯 |
+
+### ⚠️ 為什麼有 `trigger.py`（兩個平台共用同一顆引擎）
+
+`ptt.py`（Windows）與 `mac_vibetalkie.py`（macOS）原本**各有一份**觸發邏輯。
+第一份只有「一顆鍵 + 一個全域模式」，第二份只有「單一顆鍵 + 三個 if」——
+然後 main 這一邊長出了多組／配對／雙邊行為／停用／測試模式，
+而 mac 那一邊**一項都沒有**。兩份實作一定會漂移，所以與 OS 無關的部分
+全部搬到 `app/core/trigger.py`。
+
+**邊界**：`trigger.py` 匯入 `hotkey`，**不匯入** `ptt`／`recorder`／`mac_*`，
+也沒有 `ctypes`／`Quartz`／`WM_KEYDOWN`。平台層只提供兩個回呼
+（`on_start`／`on_finish`）與一個事件（`trigger.Event`）。
+`tests/test_mac_import.py` 用 AST 掃 import、用 `tokenize` 掃程式碼區把這件事釘住。
 
 ---
 
@@ -820,16 +835,22 @@ python tests/test_autosetup.py        # 相依自動安裝（偵測／--no-insta
 ```powershell
 python tests/test_hotkey_names.py     # canonical 名稱契約（名稱／側別／平台鍵碼）
 python tests/test_trigger_engine.py   # 觸發引擎（平台無關，直接餵 Event）
-python tests/test_mac_import.py       # mac 模組的可載入性（頂層不碰 pyobjc）
+python tests/test_hotkeys_patch.py    # /api/config 的 hotkeys 驗證（兩平台共用一份）
+python tests/test_mac_import.py       # mac 模組的可載入性＋共用層不得有平台相依
+python tests/test_mac_trigger.py      # mac 的觸發行為（原本被 pyobjc 閘門擋住）
 ```
 
-**macOS 專用**（需要 pyobjc，見 §8.7）：
+> ⚠️ `test_mac_trigger.py` 與 `test_mac_keys.py` **不需要 pyobjc** ——
+> `mac_vibetalkie.py` 與三個 mac 模組都刻意不在頂層 import 原生 API，
+> 所以狀態機與鍵名對照在 Windows 上也能驗（`test_mac_import.py` 把這個
+> 性質釘住）。原本它們各自有一個「import 不到 Quartz 就 return 2」的
+> 閘門，那等於讓整合期間的每一次重構都失去這兩層保護。
+
+**真的 macOS 專用**（需要 pyobjc 或 `system_profiler`，見 §8.7）：
 
 ```bash
-PYTHONPATH=<pyobjc 目錄> python tests/test_mac_keys.py      # 鍵名對照＋熱鍵比對（42 項）
-PYTHONPATH=<pyobjc 目錄> python tests/test_mac_trigger.py   # hold/toggle/double＋設定熱重載
-PYTHONPATH=<pyobjc 目錄> python tests/test_mac_e2e.py       # 真端到端（合成按鍵→錄音→ASR→注入）
-python tests/test_mac_devices.py                            # 音訊裝置列舉（解析 system_profiler）
+PYTHONPATH=<pyobjc 目錄> python tests/test_mac_e2e.py   # 真端到端（合成按鍵→錄音→ASR→注入）
+python tests/test_mac_devices.py                        # 音訊裝置列舉（解析 system_profiler）
 ```
 
 `test_mac_ui_contract.py` 與 `test_mac_api_contract.py` 不需要 pyobjc
