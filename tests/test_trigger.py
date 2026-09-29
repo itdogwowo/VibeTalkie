@@ -152,8 +152,12 @@ def test_spec_parsing() -> None:
           and hotkey_mod.parse("RightCtrl").require_e0)
     check("F9 → 0x78", hotkey_mod.parse("F9").vk == 0x78)
     s = hotkey_mod.parse("Ctrl+Alt+R")
-    check("Ctrl+Alt+R → 主鍵 R、修飾 Ctrl+Alt",
-          s.vk == 0x52 and s.modifiers == frozenset({"Ctrl", "Alt"}),
+    # ⚠️ 修飾鍵是**小寫 canonical 名稱**（`ctrl`／`alt`），不是顯示名。
+    #    理由：規格、事件、mac 的 `_mods_down` 三邊共用同一套寫法，
+    #    比對時不必再各自 `lower()` 一次（那正是漂移的來源）。
+    #    見 `tests/test_hotkey_names.py` [4]。
+    check("Ctrl+Alt+R → 主鍵 R、修飾 ctrl+alt",
+          s.vk == 0x52 and s.modifiers == frozenset({"ctrl", "alt"}),
           f"{s.vk:#x} {sorted(s.modifiers)}")
     check("順序不影響（Alt+Ctrl+R 相同）",
           hotkey_mod.parse("Alt+Ctrl+R") == hotkey_mod.parse("Ctrl+Alt+R"))

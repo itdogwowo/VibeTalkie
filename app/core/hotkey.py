@@ -49,13 +49,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field as dc_field
 
-# 修飾鍵的虛擬鍵碼（左／右都算同一個修飾鍵）
+# 修飾鍵的虛擬鍵碼（左／右都算同一個修飾鍵）。
+#
+# ⚠️ 值一律是**小寫 canonical 名稱**，與 `HotkeySpec.modifiers`、
+#    `trigger.Event.mods`、mac 的 `keys.generic_modifier()` 同一套寫法。
+#    先前用 `"Ctrl"` 這種大寫顯示名當值，於是「規格裡是 Ctrl、事件裡是 ctrl」
+#    兩邊各轉一次 —— 那就是漂移的溫床（比對時得記得 `lower()`）。
 MODIFIER_VKS: dict[int, str] = {
-    0x10: "Shift", 0xA0: "Shift", 0xA1: "Shift",
-    0x11: "Ctrl", 0xA2: "Ctrl", 0xA3: "Ctrl",
-    0x12: "Alt", 0xA4: "Alt", 0xA5: "Alt",
-    0x5B: "Win", 0x5C: "Win",
+    0x10: "shift", 0xA0: "shift", 0xA1: "shift",
+    0x11: "ctrl", 0xA2: "ctrl", 0xA3: "ctrl",
+    0x12: "alt", 0xA4: "alt", 0xA5: "alt",
+    0x5B: "win", 0x5C: "win",
 }
+
+# 修飾鍵的 canonical 名稱集合（跨平台共用的那一份）。
+_MODIFIER_NAMES: frozenset[str] = frozenset({"ctrl", "shift", "alt", "win"})
 
 # 名稱 → 虛擬鍵碼。查表時一律轉小寫並去掉空白與 `-`／`_`。
 _NAME_TO_VK: dict[str, int] = {
@@ -170,32 +178,111 @@ DISPLAY_NAMES: dict[str, str] = {
 _RIGHT_NAMES = {"rightctrl", "rightshift", "rightalt"}
 _LEFT_NAMES = {"leftctrl", "leftshift", "leftalt"}
 
+# 別名 → canonical 名稱（**不是** VK）。三件事在這裡收斂成一件：
+#   · `control`／`meta`／`escape`／`return` 這類同義寫法
+#   · `lwin`／`rwin` 這種「左／右」寫在**後面**的鍵（`_RIGHT_NAMES` 認不到）
+#   · mac 的 `cmd`／`option` 之後由 `keys.py` 的別名表接手
+_ALIASES: dict[str, str] = {"control": "ctrl", "meta": "win", "return": "enter",
+                            "escape": "esc", "lwin": "win", "rwin": "win"}
 
-def _name_label(vk: int) -> str:
+# 修飾鍵的側別寫法。⚠️ `ctrl`／`shift`／`alt` 不在此表 —— 它們是**三態**
+# （不寫側別＝左右都算），側別由事件端的 `E0` 旗標或 keycode 決定。
+_EXPLICIT_SIDE: dict[str, tuple[str, str]] = {
+    "rightctrl": ("ctrl", "right"), "rightshift": ("shift", "right"),
+    "rightalt": ("alt", "right"),
+    "leftctrl": ("ctrl", "left"), "leftshift": ("shift", "left"),
+    "leftalt": ("alt", "left"),
+    # Win 只有 `lwin`／`rwin`，沒有 `win` 的左右別名
+    "lwin": ("win", "left"), "rwin": ("win", "right"),
+}
+
+
+def _key_name_and_side(key: str) -> tuple[str, str | None]:
+    """`"rightctrl"` → `("ctrl", "right")`；`"f9"` → `("f9", None)`。
+
+    **這是「使用者的寫法 → canonical 名稱」的唯一入口。** 別名、側別前綴
+    都在這裡處理完，其他模組（`keys.generic_modifier()`、`trigger.py`）
+    都轉呼叫它 —— 三份實作的漂移症狀是「同一顆鍵在 mac 命中、在 Windows 不命中」。
+
+    ⚠️ 側別只看**字串**，不要用 `vk == 0xA2` 之類的判斷：`0xA2` 同時可能是
+    「使用者寫了 leftctrl」也可能是「UI 錄到 LeftCtrl 後存成 0xA2」，
+    而 Raw Input 送的是**通用** VK ＋ E0 旗標，根本沒有 0xA2 這種東西。
+    """
+    k = _norm(key)
+    if k in _EXPLICIT_SIDE:
+        return _EXPLICIT_SIDE[k]
+    return _ALIASES.get(k, k), None
+
+
+# 修飾鍵名稱與 VK 表的值必須一致 —— 不一致就當場炸掉，不要等到
+# 「按了沒反應」才發現（那是這個專案最常見的失敗症狀）。
+assert set(MODIFIER_VKS.values()) == _MODIFIER_NAMES, \
+    f"MODIFIER_VKS 與 _MODIFIER_NAMES 不一致：{set(MODIFIER_VKS.values())}"
+
+
+def _name_label(name: str) -> str:
     """主鍵的顯示名稱（左右側的標註在 `HotkeySpec.label` 處理）。
 
-    ⚠️ 這裡刻意**去掉** Left／Right 前綴：`0xA3` 該顯示成「Ctrl（限定右側）」
-    而不是「RightCtrl（限定右側）」—— 後者沒有錯，但讀起來像兩個限制。
+    ⚠️ 這裡刻意**去掉** Left／Right 前綴：`rightctrl` 該顯示成
+    「Ctrl（限定右側）」而不是「RightCtrl（限定右側）」—— 後者沒有錯，
+    但讀起來像兩個限制。
     """
-    raw = VK_TO_NAME.get(vk, "")
-    norm = _norm(raw)
-    if norm in _RIGHT_NAMES or norm in _LEFT_NAMES:
-        # 0xA3 → "rightctrl" → "Ctrl"；側別另外標，輸入框裡的寫法維持乾淨
-        return DISPLAY_NAMES.get(norm[5:], norm[5:].capitalize())
-    return DISPLAY_NAMES.get(norm) or (raw.upper() if raw else f"0x{vk:02X}")
+    return DISPLAY_NAMES.get(name) or name.upper()
+
 
 
 @dataclass(frozen=True)
 class HotkeySpec:
-    """一組按鍵：修飾鍵集合 + 一顆主鍵（+ 可選的左右側限制）。"""
+    """一組按鍵：canonical 名稱 + 側別 + 需要按住的修飾鍵。
 
-    vk: int                          # 主鍵的虛擬鍵碼
-    modifiers: frozenset[str]        # 需要按住的修飾鍵，例如 {"Ctrl","Alt"}
+    ## 為什麼內部表示是**名稱**而不是 VK 碼
+
+    原本這裡是 `vk: int`（Windows 虛擬鍵碼）。只有 Windows 時沒問題，
+    但 macOS 的 CGEventTap 送的是完全另一套 Carbon keycode：
+
+        右 Ctrl：Windows VK = 0xA3      macOS keycode = 62
+        F9     ：Windows VK = 0x78      macOS keycode = 101
+
+    同一個 `HotkeySpec` 在兩個平台裝兩種數字，而 `spec_hit()` 的比對依賴
+    VK 家族（`{0x11, 0xA2, 0xA3}` 是同一顆 Ctrl）→ 在 mac 上必然全錯。
+
+    所以內部表示改成**平台無關的名稱**（`"ctrl"`／`"f9"`），
+    平台鍵碼只由 `keys.py` 在平台層換算（見 `app/core/keys.py` 檔頭）。
+    VK 仍然可用（`spec.vk`），但它是**推導出來的**，只有 Windows 平台層在讀。
+    """
+
+    name: str                        # canonical 名稱，小寫：ctrl / rightctrl / f9 / r
+    modifiers: frozenset[str]        # 需要按住的修飾鍵，小寫：{"ctrl","alt"}
     side: str | None = None          # None＝左右都算；"left"／"right"＝限定該側
     # ⚠️ `compare=False`：語意相同但寫法不同的字串（`Ctrl+Alt+R` 與
     #    `Alt+Ctrl+R`）應該被視為**同一組按鍵**。若把 raw 算進相等性，
     #    「順序不影響」就會失效 —— 實測被測試抓到。
     raw: str = dc_field(default="", compare=False)
+
+    # ---------------------------------------------------------- 推導欄位
+    @property
+    def side_name(self) -> str:
+        """帶側別前綴的名稱（`rightctrl`／`leftshift`／`f9`）。
+
+        這是**平台層要比對的字串**：macOS 的 keycode 本身就分左右，
+        所以 mac 不需要另外看旗標（見 `app/core/keys.py`）。
+        """
+        return f"{self.side}{self.name}" if self.side else self.name
+
+    @property
+    def vk(self) -> int:
+        """Windows 虛擬鍵碼（**推導出來的**，只給 Windows 平台層用）。
+
+        ⚠️ 修飾鍵一律指向**通用 VK**（`rightctrl` → `0x11`），側別交給 `side` ——
+        因為 Raw Input 送的就是通用 VK ＋ `E0` 旗標，不是 `VK_RCONTROL`。
+        這與 `_single_modifier()` 原本的行為一致（那裡是直接寫死 `0x11`）。
+
+        專用 VK（`0xA2`／`0xA3`）由 `_vk_to_name_side()` 反查回名稱與側別，
+        所以「事件帶專用 VK」與「事件帶通用 VK ＋ E0」在 `spec_hit()` 裡
+        走同一條名稱比對 —— 兩者都命中，這正是原本家族比對在做的事。
+        """
+        return _NAME_TO_VK.get(self.name, 0)
+
 
     # 舊欄位的相容視圖（`require_e0` == 限定右側）。
     # 保留是因為 ptt.py 早期版本與外部工具可能讀它；值一律由 side 推導。
@@ -206,7 +293,7 @@ class HotkeySpec:
     @property
     def main_is_modifier(self) -> bool:
         """主鍵本身是不是修飾鍵（例如單獨一顆 Ctrl 當熱鍵）。"""
-        return self.vk in MODIFIER_VKS
+        return self.name in _MODIFIER_NAMES
 
     @property
     def is_native_device_key(self) -> bool:
@@ -215,18 +302,36 @@ class HotkeySpec:
         用途：判斷要不要限定裝置來源。使用者改成別的鍵就代表他想用
         鍵盤／別的來源，這時再要求裝置符合 filter 就等於「設定沒作用」。
         """
-        return self.vk == 0x11 and self.side == "right" and not self.modifiers
+        return self.name == "ctrl" and self.side == "right" and not self.modifiers
 
     @property
     def label(self) -> str:
-        mods = "+".join(sorted(self.modifiers))
-        main = _name_label(self.vk)
+        mods = "+".join(DISPLAY_NAMES.get(m, m) for m in sorted(self.modifiers))
+        main = _name_label(self.name)
         s = f"{mods}+{main}" if mods else main
         return f"{s}（限定右側）" if self.require_e0 else s
 
 
 class HotkeyError(ValueError):
     """按鍵規格無法解析（附上原因，呼叫端要顯示給使用者）。"""
+
+
+def spec_from_vk(vk: int, require_e0: bool = False,
+                 raw: str = "") -> HotkeySpec:
+    """**舊介面**：用 Windows 鍵碼建一組規格（命令列 `--key-vk` 還在用）。
+
+    `HotkeySpec` 的內部表示已經改成 canonical 名稱，所以建構子收的是
+    `name=`／`side=`。但 `ptt.PttDaemon(key_vk=..., require_e0=...)` 是
+    既有的公開參數，把它翻過來的工作放在這裡，而不是散在呼叫端。
+
+    ⚠️ 認不得的鍵碼**不猜**（專案規則 2）—— 退回 `DEFAULT_SPEC`。
+    """
+    name, side = _vk_to_name_side(int(vk))
+    if not name:
+        return parse(DEFAULT_SPEC)
+    if require_e0 and name in _MODIFIER_NAMES:
+        side = "right"
+    return HotkeySpec(name=name, modifiers=frozenset(), side=side, raw=raw)
 
 
 def parse(spec: str) -> HotkeySpec:
@@ -242,46 +347,40 @@ def parse(spec: str) -> HotkeySpec:
     if not tokens:
         raise HotkeyError(f"看不懂的按鍵：{spec!r}")
 
-    modifiers: set[str] = set()
-    main_vk: int | None = None
+    mod_names: list[str] = []
+    main_name: str | None = None
     side: str | None = None
 
     for tok in tokens:
         key = _norm(tok)
-        vk = _NAME_TO_VK.get(key)
-        if vk is None:
+        if key not in _NAME_TO_VK:
             raise HotkeyError(f"認不得的按鍵名稱：{tok!r}")
-        if vk in MODIFIER_VKS:
-            modifiers.add(MODIFIER_VKS[vk])
+        name, tok_side = _key_name_and_side(key)
+        if name in _MODIFIER_NAMES:
+            mod_names.append(name)
             # 明確寫「RightCtrl」時要限定右側（裝置原生送的就是右 Ctrl）；
             # 「LeftCtrl」同理限定左側 —— 否則左右不分，設定形同虛設。
-            if key in _RIGHT_NAMES:
-                side = "right"
-            elif key in _LEFT_NAMES:
-                side = "left"
+            if tok_side:
+                side = tok_side
             continue
-        if main_vk is not None:
+        if main_name is not None:
             raise HotkeyError(f"只能有一顆主鍵，但看到 {tok!r} 與另一顆")
-        main_vk = vk
+        main_name = name
+        if tok_side:
+            side = tok_side
 
-    if main_vk is None:
+    if main_name is None:
         # 只有修飾鍵 → 允許（例如單獨一顆 Ctrl 當熱鍵，這正是裝置的行為）
-        if len(modifiers) == 1:
-            return _single_modifier(next(iter(modifiers)), side, raw)
+        if len(mod_names) == 1:
+            return HotkeySpec(name=mod_names[0], modifiers=frozenset(),
+                              side=side, raw=raw)
         raise HotkeyError("至少要有一顆主鍵（或單獨一顆 Ctrl／Shift／Alt）")
 
-    return HotkeySpec(vk=main_vk, modifiers=frozenset(modifiers),
+    # ⚠️ 主鍵若是修飾鍵家族的成員，上面已經 `continue` 掉了（它會變成
+    #    `mod_names` 的一員），所以走到這裡的 `modifiers` 一定是「另外按住的」。
+    return HotkeySpec(name=main_name, modifiers=frozenset(mod_names),
                       side=side, raw=raw)
 
-
-def _single_modifier(name: str, side: str | None, raw: str) -> HotkeySpec:
-    """「只有一顆修飾鍵」的熱鍵（例如單獨按 Ctrl）。
-
-    主鍵用**通用**的 VK（`VK_CONTROL`），側別交給 `side` 判定 ——
-    因為 Raw Input 送的是通用 VK ＋ E0 旗標，不是 `VK_RCONTROL`。
-    """
-    vk = {"Ctrl": 0x11, "Shift": 0x10, "Alt": 0x12, "Win": 0x5B}[name]
-    return HotkeySpec(vk=vk, modifiers=frozenset(), side=side, raw=raw)
 
 
 # 預設值：裝置原生送出的就是右 Ctrl（見 docs/hardware.md §3.3）
@@ -546,66 +645,94 @@ def binding_text(start: "HotkeySpec", start_mode: str | None = None,
 
 
 # --------------------------------------------------------------- 多鍵綁定
-# 同一家族但 VK 不同的鍵，在**事件比對**時要視為相等。
+# 同一顆鍵可能有**多種寫法**，事件比對時要視為相等。
 #
-# 為什麼需要：**兩種來源用的 VK 不一樣。** 實測（docs/hardware.md §3.3）：
+# 為什麼需要：**兩種來源用的鍵碼不一樣。** 實測（docs/hardware.md §3.3）：
 #   · Raw Input 回報**通用** VK_CONTROL（0x11），靠 E0 旗標分左右
 #   · Low-Level Hook 回報**專用** VK_RCONTROL（0xA3）
-# 所以設定檔寫 `RightCtrl`（0x11 + 限定右側）時，事件可能帶 0x11（+E0）
-# 或 0xA3。不做這層對應，單獨一顆 RightCtrl 就永遠觸發不了（實際踩到）。
+#   · macOS 回報 Carbon keycode + `rightctrl` 這種帶側別的名稱
+# 所以設定檔寫 `RightCtrl` 時，事件可能帶 0x11（+E0）、0xA3、
+# 或 macOS 的 keycode 62。不做這層對應，單獨一顆 RightCtrl 就永遠觸發不了
+# （實際踩到）。
 #
-# ⚠️ 只有「通用 ↔ 左右專用」算同一顆（側別比對見 `spec_hit`）；
-#    `side=None` 時左右都算，這正是 `Ctrl+Alt+R` 這種寫法該有的行為。
-_VK_FAMILIES: tuple[frozenset[int], ...] = (
-    frozenset({0x10, 0xA0, 0xA1}),          # Shift / LShift / RShift
-    frozenset({0x11, 0xA2, 0xA3}),          # Ctrl / LCtrl / RCtrl
-    frozenset({0x12, 0xA4, 0xA5}),          # Alt / LAlt / RAlt
-    frozenset({0x5B, 0x5C}),                # LWin / RWin
-)
+# ⚠️ **改成名稱中心之後，這張表只剩「VK → 名稱」一個用途**：把 Windows
+#    的鍵碼換算成 canonical 名稱，之後的比對全部走名稱。名稱層沒有
+#    「家族」這種東西 —— `rightctrl` 與 `ctrl` 的關係由 `side` 表達。
+_VK_TO_NAME_SIDE: dict[int, tuple[str, str | None]] = {}
+for _n, _v in _NAME_TO_VK.items():
+    # 同一個 VK 可能有多個寫法（`ctrl`／`control`）—— 留第一個就好，
+    # 因為 `_key_name_and_side()` 保證同義寫法收斂成同一個 canonical 名稱。
+    _VK_TO_NAME_SIDE.setdefault(_v, _key_name_and_side(_n))
 
-# 「同一家族但左右不同」的那些 VK —— 只有它們需要看 E0／側別。
-# 其餘的鍵（F9、A…）左右無意義，不該因為事件帶了 E0 就被判成別顆鍵。
-_SIDE_SPECIFIC_VKS: frozenset[int] = frozenset(
-    vk for fam in _VK_FAMILIES for vk in fam
-)
+
+def _vk_to_name_side(vk: int) -> tuple[str, str | None]:
+    """Windows 鍵碼 → `(canonical 名稱, 名稱自帶的側別)`。
+
+    不認得的鍵碼回 `("", None)` —— **不要猜**（專案規則 2）。
+    呼叫端要能容忍空名稱並據此忽略事件。
+    """
+    return _VK_TO_NAME_SIDE.get(int(vk), ("", None))
 
 
 def vk_matches(a: int, b: int) -> bool:
-    """兩個 VK 是不是同一顆鍵（含左右通用／專用的對應）。"""
+    """兩個 VK 是不是同一顆鍵（含左右通用／專用的對應）。
+
+    ⚠️ 保留給外部呼叫端（舊工具、診斷腳本）。**內部比對請用 `spec_hit()`**，
+    它走 canonical 名稱，兩個平台同一條路。
+    """
     if a == b:
         return True
-    for fam in _VK_FAMILIES:
-        if a in fam and b in fam:
-            return True
-    return False
+    na, sa = _vk_to_name_side(a)
+    nb, sb = _vk_to_name_side(b)
+    if not na or not nb:
+        return False
+    # 同一顆鍵：名稱相同，且側別不衝突（任一邊沒寫側別＝通用，算命中）
+    return na == nb and (sa is None or sb is None or sa == sb)
 
 
-def event_side(vk: int, e0: bool) -> str | None:
-    """這次按鍵事件是左邊還是右邊的那顆修飾鍵？
+def side_of(name: str, by_name_side: str | None = None,
+            e0: bool = False) -> str | None:
+    """這顆鍵是左邊還是右邊的那一顆？（`None`＝左右無意義）
 
     判準（實測）：
-      · Raw Input 給**通用** VK（0x11）＋ E0 旗標 → 由旗標決定
-      · 也可能直接給**專用** VK（0xA2／0xA3）
+      · **名稱已經帶側別**（mac 的 keycode、或已解析過的名稱）→ **名稱優先**
+      · **通用修飾鍵名稱 ＋ E0 旗標**（Windows Raw Input）→ 由旗標決定
       · 不是修飾鍵家族的鍵 → None（左右無意義）
+
+    ⚠️ 名稱優先不是任意選擇：Windows 的 Raw Input 送通用 VK ＋ E0，
+    mac 送的是**不同 keycode**（名稱已含側別）。兩者同時存在時，
+    名稱是更精確的那一個。
     """
-    if vk == 0xA2 or vk == 0xA0 or vk == 0xA4 or vk == 0x5B:
-        return "left"
-    if vk == 0xA3 or vk == 0xA1 or vk == 0xA5 or vk == 0x5C:
-        return "right"
-    if vk in _SIDE_SPECIFIC_VKS:            # 通用 VK（0x11 等）→ 看 E0
+    if by_name_side:
+        return by_name_side
+    if _norm(name) in _MODIFIER_NAMES:
         return "right" if e0 else "left"
     return None
 
 
-def spec_hit(spec: HotkeySpec, vk: int, e0: bool) -> bool:
-    """這顆鍵是不是 `spec` 的主鍵（含 VK 家族對應與左右側判定）。
+def event_side(vk: int, e0: bool) -> str | None:
+    """**Windows 入口**：VK ＋ E0 旗標 → 側別（保留給舊呼叫端與測試）。"""
+    name, by_name = _vk_to_name_side(int(vk))
+    return side_of(name, by_name, e0)
+
+
+def spec_hit(spec: HotkeySpec, key, e0: bool = False) -> bool:
+    """這顆鍵是不是 `spec` 的主鍵（含左右側判定）。
+
+    `key` 可以是 **VK 整數**（Windows 呼叫端）或 **canonical 名稱字串**
+    （mac 呼叫端、以及抽出來的 `app/core/trigger.py`）—— 兩條路最後都走
+    同一段名稱比對，這正是「兩個平台共用一顆引擎」的接縫。
 
     ⚠️ 這是**主鍵**的比對，不含修飾鍵條件（那個要用 `mods_ok`）。
     """
-    if not vk_matches(vk, spec.vk):
+    if isinstance(key, str):
+        name, by_name = _key_name_and_side(key)
+    else:
+        name, by_name = _vk_to_name_side(int(key))
+    if not name or name != spec.name:
         return False
     if spec.side is not None:
-        got = event_side(vk, e0)
+        got = side_of(name, by_name, e0)
         if got is not None and got != spec.side:
             return False
     return True
@@ -614,15 +741,16 @@ def spec_hit(spec: HotkeySpec, vk: int, e0: bool) -> bool:
 def mods_ok(spec: HotkeySpec, mods_down: set[str] | frozenset[str]) -> bool:
     """修飾鍵是否**剛好**符合（不多也不少）。
 
-    `mods_down` 是「目前按住的修飾鍵集合」，裡面的名字來自 `MODIFIER_VKS`
-    （`Ctrl`／`Shift`／`Alt`／`Win`，**不分左右**）。
+    `mods_down` 是「目前按住的修飾鍵集合」，**小寫 canonical 名稱**
+    （`{"ctrl","alt"}`）—— 不分左右，左右由 `spec.side` 與事件的鍵名判定。
 
     ⚠️ 主鍵本身就是修飾鍵時（例如單獨一顆 Ctrl 當錄音鍵），它自己一定
     會出現在 `mods_down` 裡 —— 那不是「需要另外按住的修飾鍵」，要先扣掉。
     """
-    have = set(mods_down)
+    # 容忍大寫寫法（`"Ctrl"`）—— 舊呼叫端與手寫的測試可能還在用。
+    have = {str(m).lower() for m in mods_down}
     if spec.main_is_modifier:
-        have.discard(MODIFIER_VKS[spec.vk])
+        have.discard(spec.name)
     return have == set(spec.modifiers)
 
 

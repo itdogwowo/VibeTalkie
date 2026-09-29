@@ -62,19 +62,29 @@ def _windows_tables() -> tuple[dict[str, int], dict[int, str]]:
 
     這裡刻意**不自己抄一份**。`hotkey._NAME_TO_VK` 是那個模組的唯一真相，
     任何新增的按鍵名稱都應該改那裡，這裡自動跟上。
-    """
-    import hotkey as _hotkey            # 同目錄，呼叫端已把 app/core 放進 sys.path
 
-    # _NAME_TO_VK 是模組私有的，但它是**資料**不是行為。
-    # 與其複製一份（會漂移），不如直接引用並在這裡註明依賴。
-    name_to_vk = dict(_hotkey._NAME_TO_VK)          # noqa: SLF001
-    vk_to_name: dict[int, str] = {}
-    for name, vk in name_to_vk.items():
-        # 每個 VK 只留一個「最正式」的名稱：優先序見 _PREFERRED
-        cur = vk_to_name.get(vk)
-        if cur is None or _rank(name) < _rank(cur):
-            vk_to_name[vk] = name
-    return name_to_vk, vk_to_name
+    ⚠️ 有快取：這個函式會在**每一個按鍵事件**被呼叫（`code_to_name`），
+    沒有快取的話每個事件都重建一次反轉 dict。快取失效的時機是
+    「`hotkey` 在執行期被改表」—— 那件事不會發生（表是模組層常數）。
+    """
+    global _WIN_CACHE
+    if _WIN_CACHE is None:
+        import hotkey as _hotkey            # 同目錄，呼叫端已把 app/core 放進 sys.path
+
+        # _NAME_TO_VK 是模組私有的，但它是**資料**不是行為。
+        # 與其複製一份（會漂移），不如直接引用並在這裡註明依賴。
+        name_to_vk = dict(_hotkey._NAME_TO_VK)          # noqa: SLF001
+        vk_to_name: dict[int, str] = {}
+        for name, vk in name_to_vk.items():
+            # 每個 VK 只留一個「最正式」的名稱：優先序見 _PREFERRED
+            cur = vk_to_name.get(vk)
+            if cur is None or _rank(name) < _rank(cur):
+                vk_to_name[vk] = name
+        _WIN_CACHE = (name_to_vk, vk_to_name)
+    return _WIN_CACHE
+
+
+_WIN_CACHE: tuple[dict[str, int], dict[int, str]] | None = None
 
 
 # 同一個鍵碼有多個寫法時（`ctrl` / `control`、`rightctrl` / …），
@@ -250,12 +260,15 @@ def code_to_name(code: int) -> str | None:
 
 
 def is_modifier(name: str) -> bool:
-    """這個名稱是不是修飾鍵（Ctrl／Shift／Alt／Win）。"""
-    n = _canonical(name)
-    if is_macos():
-        return n in MACOS_MODIFIER_FLAGS
+    """這個名稱是不是修飾鍵（Ctrl／Shift／Alt／Win，含左右寫法）。
+
+    ⚠️ 這是 `hotkey._MODIFIER_NAMES` 的**薄包裝，不是第二份清單** ——
+    「哪些名字算修飾鍵」只有一個真相來源（`app/core/hotkey.py`）。
+    兩份清單的漂移症狀是「mac 認為它是修飾鍵、Windows 不認為」。
+    """
     import hotkey as _hotkey
-    return _hotkey._NAME_TO_VK.get(n) in _hotkey.MODIFIER_VKS      # noqa: SLF001
+    name_only, _side = _hotkey._key_name_and_side(_canonical(name))   # noqa: SLF001
+    return name_only in _hotkey._MODIFIER_NAMES                        # noqa: SLF001
 
 
 def modifier_flag(name: str) -> int | None:
@@ -266,14 +279,17 @@ def modifier_flag(name: str) -> int | None:
 def generic_modifier(name: str) -> str:
     """把左／右的寫法收斂成通用名：`rightctrl` → `ctrl`。
 
-    `hotkey.parse()` 的 modifiers 集合用的是通用名（`Ctrl`），
-    所以比對時要把事件端的 `rightctrl` 也收斂過去。
+    規格與事件兩邊都比對**通用名**（`hotkey.HotkeySpec.modifiers` 是小寫
+    通用名），側別則由事件的鍵名或 `E0` 旗標決定。
+
+    ⚠️ 同樣是 `hotkey._key_name_and_side()` 的**薄包裝**。先前這裡自己寫了
+    一份 `startswith("right")/("left")` 的剝皮邏輯 —— 那種第二份實作正是
+    「同一顆鍵在 mac 命中、在 Windows 不命中」的成因（`lwin`／`rwin` 就
+    不在那份邏輯的涵蓋範圍內，而 `hotkey` 的別名表認得它們）。
     """
-    n = _canonical(name)
-    for side in ("right", "left"):
-        if n.startswith(side) and n[len(side):] in ("ctrl", "shift", "alt"):
-            return n[len(side):]
-    return n
+    import hotkey as _hotkey
+    name_only, _side = _hotkey._key_name_and_side(_canonical(name))   # noqa: SLF001
+    return name_only
 
 
 def all_names() -> list[str]:

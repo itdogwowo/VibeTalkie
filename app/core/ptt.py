@@ -113,9 +113,11 @@ class PttDaemon:
         self._hotkey_spec = None
         # 純終端機模式（沒有 cfg_provider）用的單鍵設定：
         # 把建構參數轉成「一組」綁定，這樣後面的比對邏輯只有一條路徑。
-        self._fallback_spec = hotkey.HotkeySpec(
-            vk=key_vk, modifiers=frozenset(),
-            side=("right" if require_e0 else None), raw="")
+        #
+        # ⚠️ `key_vk` / `require_e0` 是**建構參數的舊介面**（命令列 `--key-vk`），
+        #    所以要在這裡翻譯成 canonical 名稱 —— `HotkeySpec` 的內部表示
+        #    已經是名稱（見 app/core/hotkey.py），不再收 `vk=` 這個關鍵字。
+        self._fallback_spec = hotkey.spec_from_vk(key_vk, require_e0)
         self._fallback_binding = hotkey.HotkeyBindings([self._fallback_spec])
         # 目前按住的修飾鍵（自己維護 —— Raw Input 只給單一事件，
         # 不給「現在 Ctrl 有沒有按住」）
