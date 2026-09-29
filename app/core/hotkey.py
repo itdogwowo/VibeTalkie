@@ -754,6 +754,43 @@ def mods_ok(spec: HotkeySpec, mods_down: set[str] | frozenset[str]) -> bool:
     return have == set(spec.modifiers)
 
 
+@dataclass(frozen=True)
+class Binding:
+    """**一組**完整的錄音鍵設定（開始鍵＋行為＋結束鍵＋行為＋啟用狀態）。
+
+    ## 為什麼需要這個型別（而不是五條平行的 tuple）
+
+    原本 `HotkeyBindings` 用五條平行的 tuple（`specs` / `modes` / `ends` /
+    `end_modes` / `enabled`）存，查值靠 `self.specs.index(spec)`。
+    那在「每一顆開始鍵只出現一次」時沒問題 —— 但**同一顆開始鍵可以合法地
+    出現兩次**（`F9@double` 與 `F9,Esc@toggle` 是不同的兩組）。
+
+    一旦重複，`list.index()` **永遠回第一筆**，於是第二筆的行為、結束鍵、
+    **啟用狀態**全部讀成第一筆的值。實際症狀：
+
+        hotkeys = ["~F9", "F9,Esc"]      # 一組停用、一組啟用
+        → entries 寫回去變成 ["~F9", "~F9,Esc"]   # 兩組都停用！
+        → 使用者的第二組永遠開不起來，而且畫面看起來都正常
+
+    所以查值一律以「整筆描述」為 key（`quad()`），不再靠 `.index()`。
+    """
+
+    spec: HotkeySpec
+    mode: str = MODE_HOLD                    # 開始行為
+    end: HotkeySpec | None = None            # 結束鍵（None＝沒有）
+    end_mode: str = ""                       # 結束行為（沒有結束鍵時是空字串）
+    enabled: bool = True                     # `~` 前綴＝停用
+
+    def quad(self) -> tuple:
+        """這一組的**完整描述**（去重與查值都用它當 key）。
+
+        `raw` 不參與相等性（見 `HotkeySpec`），所以 `F9` 與 `f9` 的
+        `quad()` 相等 —— 那正是我們要的去重語意。
+        """
+        return (self.spec, self.mode or MODE_HOLD,
+                self.end, self.end_mode or MODE_HOLD, self.enabled)
+
+
 class HotkeyBindings:
     """**多組**錄音鍵，每一組各自帶**觸發方式**。
 
@@ -764,6 +801,9 @@ class HotkeyBindings:
     為什麼模式要跟著每一組：同一句話的回饋是「無法錄製雙擊」——
     真實情境是「藍牙麥克風按住說話 ＋ 鍵盤 F9 雙擊」。
     全域一個模式做不到這件事，所以模式是**每一組自己的屬性**。
+
+    ⚠️ 同一顆開始鍵可以出現在多組（`F9@double` ＋ `F9,Esc@toggle`）——
+    所以任何「用規格查值」的動作都要能容忍重複（見 `Binding`）。
     """
 
     def __init__(self, specs: list[HotkeySpec] | tuple[HotkeySpec, ...],
@@ -771,30 +811,57 @@ class HotkeyBindings:
                  ends: list[HotkeySpec | None] | tuple[HotkeySpec | None, ...] | None = None,
                  end_modes: list[str] | tuple[str, ...] | None = None,
                  enabled: list[bool] | tuple[bool, ...] | None = None):
-        self.specs: tuple[HotkeySpec, ...] = tuple(specs)
-        if modes is None:
-            self.modes: tuple[str, ...] = (MODE_HOLD,) * len(self.specs)
-        else:
-            self.modes = tuple(modes)
-        # 每一組的**結束鍵**（None＝沒有，收尾交給「開始行為」）
-        if ends is None:
-            self.ends: tuple[HotkeySpec | None, ...] = (None,) * len(self.specs)
-        else:
-            self.ends = tuple(ends)
-        # 每一組的**結束行為**：hold＝鬆開才停、toggle＝再按一下停、double＝連按兩下停
-        if end_modes is None:
-            self.end_modes: tuple[str, ...] = ("",) * len(self.specs)
-        else:
-            self.end_modes = tuple(end_modes)
-        # 每一組的**啟用狀態**（停用的組合保留在設定裡，只是不比對）
-        if enabled is None:
-            self.enabled: tuple[bool, ...] = (True,) * len(self.specs)
-        else:
-            self.enabled = tuple(enabled)
-        for name, seq in (("開始行為", self.modes), ("結束鍵", self.ends),
-                          ("結束行為", self.end_modes), ("啟用狀態", self.enabled)):
-            if len(seq) != len(self.specs):
-                raise ValueError(f"規格 {len(self.specs)} 組但{name} {len(seq)} 個")
+        self.bindings: tuple[Binding, ...] = tuple(
+            Binding(spec=spec,
+                    mode=(modes[i] if modes is not None else MODE_HOLD),
+                    end=(ends[i] if ends is not None else None),
+                    end_mode=(end_modes[i] if end_modes is not None else ""),
+                    enabled=(enabled[i] if enabled is not None else True))
+            for i, spec in enumerate(tuple(specs)))
+        n = len(self.bindings)
+        for name, seq in (("開始行為", modes), ("結束鍵", ends),
+                          ("結束行為", end_modes), ("啟用狀態", enabled)):
+            if seq is not None and len(seq) != n:
+                raise ValueError(f"規格 {n} 組但{name} {len(seq)} 個")
+
+    # ------------------------------------------------ 相容的平行視圖
+    #
+    # ⚠️ 這四個 property 是**為了相容既有讀取端**（測試、工具、UI）而存在。
+    #    內部一律以 `self.bindings` 為準 —— 兩份平行資料就是這個 class
+    #    原本那個 bug 的來源。
+    @property
+    def specs(self) -> tuple[HotkeySpec, ...]:
+        return tuple(b.spec for b in self.bindings)
+
+    @property
+    def modes(self) -> tuple[str, ...]:
+        return tuple(b.mode for b in self.bindings)
+
+    @property
+    def ends(self) -> tuple[HotkeySpec | None, ...]:
+        return tuple(b.end for b in self.bindings)
+
+    @property
+    def end_modes(self) -> tuple[str, ...]:
+        return tuple(b.end_mode for b in self.bindings)
+
+    @property
+    def enabled(self) -> tuple[bool, ...]:
+        return tuple(b.enabled for b in self.bindings)
+
+    # ------------------------------------------------ 查值（以整筆描述為 key）
+    def _find(self, spec: HotkeySpec, *,
+              enabled: bool | None = None) -> Binding | None:
+        """找出符合這一顆開始鍵的那一筆。
+
+        同一顆鍵有多筆時（合法情境）用 `enabled` 消歧義；
+        仍然多筆就回第一筆 —— 呼叫端只是要一個代表值（顯示用）。
+        """
+        hits = [b for b in self.bindings if b.spec == spec]
+        if enabled is not None:
+            hits = [b for b in hits if b.enabled == enabled]
+        return hits[0] if hits else None
+
 
     @property
     def active(self) -> tuple[HotkeySpec, ...]:
@@ -803,57 +870,18 @@ class HotkeyBindings:
         ⚠️ 停用的組合仍然留在清單裡（UI 要顯示、設定檔要看得到），
         但事件比對時完全不理它 —— 這是「暫時關掉某一組」的實作方式。
         """
-        return tuple(s for s, on in zip(self.specs, self.enabled) if on)
+        return tuple(b.spec for b in self.bindings if b.enabled)
 
     def is_enabled(self, spec: HotkeySpec) -> bool:
-        return bool(self._at(self.enabled, spec))
+        """這一組啟用中嗎？
 
-    def quads(self) -> list[tuple[HotkeySpec, str, HotkeySpec | None, str]]:
-        """**啟用中**的 `(開始, 開始行為, 結束, 結束行為)`。"""
-        return [(s, m, e, em) for s, m, e, em in
-                zip(self.specs, self.modes, self.ends, self.end_modes) if self.is_enabled(s)]
-
-    def __len__(self) -> int:
-        return len(self.specs)
-
-    def __iter__(self):
-        return iter(self.specs)
-
-    def __bool__(self) -> bool:
-        return bool(self.specs)
-
-    def _at(self, seq, spec):
-        try:
-            return seq[self.specs.index(spec)]
-        except (ValueError, IndexError):
-            return None
-
-    def mode_of(self, spec: HotkeySpec) -> str:
-        """這一組的**開始行為**（找不到就退回按一下開始，絕不回 None）。"""
-        return self._at(self.modes, spec) or MODE_HOLD
-
-    def end_of(self, spec: HotkeySpec) -> HotkeySpec | None:
-        """這一組的**結束鍵**（None＝沒有指定，用 start 的 hold 收尾）。"""
-        return self._at(self.ends, spec)
-
-    def end_mode_of(self, spec: HotkeySpec) -> str:
-        """這一組的**結束行為**（沒有結束鍵時回空字串＝不適用）。
-
-        hold＝鬆開才停（預設）、toggle＝再按一下停、double＝連按兩下停。
+        ⚠️ 同一顆開始鍵可能有多筆（一筆停用、一筆啟用），所以判準是
+        **「有任何一筆啟用的就算啟用」** —— 不能只看 `_find()` 回的第一筆。
+        實測踩到：`["~F9", "F9,Esc"]` 的 `entries` 兩筆都被寫成 `~`，
+        等於「存一次設定就把第二組也停用」。
         """
-        if self.end_of(spec) is None:
-            return ""
-        return self._at(self.end_modes, spec) or MODE_HOLD
-
-    def start_of(self, end_spec: HotkeySpec) -> HotkeySpec | None:
-        """反查：這顆鍵是不是某一組的結束鍵？回傳那一組的開始鍵。"""
-        for s, end in zip(self.specs, self.ends):
-            if end is not None and end == end_spec:
-                return s
-        return None
-
-    def pairs(self) -> list[tuple[HotkeySpec, str]]:
-        return list(zip(self.specs, self.modes))
+        hits = [b for b in self.bindings if b.spec == spec]
+        return any(b.enabled for b in hits)
 
     def quads(self) -> list[tuple[HotkeySpec, str, HotkeySpec | None, str]]:
         """**全部**的 `(開始, 開始行為, 結束, 結束行為)`（含停用的）。
@@ -862,43 +890,102 @@ class HotkeyBindings:
         少回一筆就等於「存一次設定就刪掉一個組合」。
         要比對／觸發請用 `active`。
         """
-        return list(zip(self.specs, self.modes, self.ends, self.end_modes))
+        return [(b.spec, b.mode, b.end, b.end_mode) for b in self.bindings]
+
+    def __len__(self) -> int:
+        return len(self.bindings)
+
+    def __iter__(self):
+        return iter(self.specs)
+
+    def __bool__(self) -> bool:
+        return bool(self.bindings)
+
+    def mode_of(self, spec: HotkeySpec) -> str:
+        """這一組的**開始行為**（找不到就退回按一下開始，絕不回 None）。"""
+        b = self._find(spec)
+        return (b.mode if b else None) or MODE_HOLD
+
+    def end_of(self, spec: HotkeySpec) -> HotkeySpec | None:
+        """這一組的**結束鍵**（None＝沒有指定，用 start 的 hold 收尾）。"""
+        b = self._find(spec)
+        return b.end if b else None
+
+    def end_mode_of(self, spec: HotkeySpec) -> str:
+        """這一組的**結束行為**（沒有結束鍵時回空字串＝不適用）。
+
+        hold＝鬆開才停（預設）、toggle＝再按一下停、double＝連按兩下停。
+        """
+        b = self._find(spec)
+        if b is None or b.end is None:
+            return ""
+        return b.end_mode or MODE_HOLD
+
+    def start_of(self, end_spec: HotkeySpec) -> HotkeySpec | None:
+        """反查：這顆鍵是不是某一組的結束鍵？回傳那一組的開始鍵。"""
+        for b in self.bindings:
+            if b.end is not None and b.end == end_spec:
+                return b.spec
+        return None
+
+    def pairs(self) -> list[tuple[HotkeySpec, str]]:
+        return [(b.spec, b.mode) for b in self.bindings]
 
     @property
     def entries(self) -> list[str]:
         """寫回設定檔用的字串清單（停用的帶 `~` 前綴）。
 
         `["RightCtrl", "~F9,Esc@toggle"]`
+
+        ⚠️ 逐筆用自己的 `enabled` 決定要不要加 `~` —— **不要**用
+        `is_enabled(spec)` 反查（同一顆鍵有多筆時會全部套用同一種結果，
+        症狀是「存一次設定就把第二組也停用」）。
         """
-        return [(binding_text(s, m, e, em) if self.is_enabled(s)
-                 else DISABLED_PREFIX + binding_text(s, m, e, em))
-                for s, m, e, em in self.quads()]
+        return [(DISABLED_PREFIX if not b.enabled else "")
+                + binding_text(b.spec, b.mode, b.end, b.end_mode)
+                for b in self.bindings]
 
     @property
     def active_label(self) -> str:
         """**啟用中**的組合，用「或」串起來（給提示訊息用）。"""
-        on = [self.label_of(s) for s in self.active]
-        off = [self.label_of(s).replace("（停用）", "", 1)
-               for s in self.specs if not self.is_enabled(s)]
+        on = [self.label_of(b.spec) for b in self.bindings if b.enabled]
+        off = [self.label_of(b.spec).replace("（停用）", "", 1)
+               for b in self.bindings if not b.enabled]
         text = " 或 ".join(on) if on else "（沒有啟用中的錄音鍵）"
         if off:
             text += f"　（停用：{'、'.join(off)}）"
         return text
 
     def label_of(self, spec: HotkeySpec) -> str:
-        """單一組的顯示標籤（含兩邊的行為與啟用狀態）。"""
-        start = START_MODE_LABELS.get(self.mode_of(spec), self.mode_of(spec))
-        end = self.end_of(spec)
-        if end is None:
-            text = f"{spec.label}·{start}"
+        """單一組的顯示標籤（含兩邊的行為與啟用狀態）。
+
+        ⚠️ 同一顆開始鍵可能有多筆（`F9@double` ＋ `F9,Esc@toggle`）——
+        這種情況回的是**那一顆鍵的所有寫法**，不是只回第一筆。
+        否則畫面上兩列會顯示成一樣的字，使用者看不出差別在哪。
+        """
+        hits = [b for b in self.bindings if b.spec == spec]
+        if not hits:
+            return spec.label
+        return " ／ ".join(self._label_of_binding(b) for b in hits)
+
+    def _label_of_binding(self, b: "Binding") -> str:
+        start = START_MODE_LABELS.get(b.mode or MODE_HOLD, b.mode or MODE_HOLD)
+        if b.end is None:
+            text = f"{b.spec.label}·{start}"
         else:
-            tail = f"按 {spec_text(end)} {END_MODE_LABELS.get(self.end_mode_of(spec), '')}"
-            text = f"{spec.label}·{start}、{tail}"
-        return text if self.is_enabled(spec) else f"（停用）{text}"
+            tail = (f"按 {spec_text(b.end)} "
+                    f"{END_MODE_LABELS.get(b.end_mode or MODE_HOLD, '')}")
+            text = f"{b.spec.label}·{start}、{tail}"
+        return text if b.enabled else f"（停用）{text}"
 
     @property
     def labels(self) -> list[str]:
-        return [self.label_of(s) for s in self.specs]
+        """每一**筆**的標籤（順序與 `entries` 一致）。
+
+        ⚠️ 逐筆算，不是「對每個不重複的規格算一次」—— 同一顆開始鍵的
+        兩組是不同的兩筆，UI 要顯示成兩列。
+        """
+        return [self._label_of_binding(b) for b in self.bindings]
 
     @property
     def label(self) -> str:
@@ -912,7 +999,7 @@ class HotkeyBindings:
         只要**有任一組**不是裝置原生鍵，就放行 —— 否則「用鍵盤錄音」
         會被裝置篩選擋掉（那正是使用者改成 F9 的目的）。
         """
-        return any(not s.is_native_device_key for s in self.specs)
+        return any(not b.spec.is_native_device_key for b in self.bindings)
 
     def matched(self, vk: int, e0: bool, mods_down: set[str] | frozenset[str]) -> list[HotkeySpec]:
         """這次事件命中了哪幾組？**只看啟用中的**（停用的完全不理）。
@@ -960,6 +1047,7 @@ def bindings(specs: list[str] | tuple[str, ...] | str | None,
     ends: list[HotkeySpec | None] = []
     end_modes: list[str] = []
     enabled: list[bool] = []
+    seen: list = []
     bad: list[str] = []
     for raw in raw_list:
         try:
@@ -967,12 +1055,28 @@ def bindings(specs: list[str] | tuple[str, ...] | str | None,
         except HotkeyError as exc:
             bad.append(f"{raw}（{exc}）")
             continue
-        # ⚠️ 去重要比**解析後的規格**，不是原始字串 —— `F9` 與 `f9`、
-        # `Ctrl+Alt+R` 與 `ctrl-alt-r` 都是同一組（`raw` 不參與相等性比較，
-        # 見 `HotkeySpec`）。先前比字串，重複的寫法會塞進兩組，
-        # 結果是「同一個鍵被觸發兩次」的隱患。
-        if spec in good:
+        # ⚠️ 去重要比**整筆描述**（開始鍵＋開始行為＋結束鍵＋結束行為），
+        #    不是只比開始鍵的規格。
+        #
+        #    兩個理由：
+        #      1. 寫法不同、語意相同要去重：`F9` 與 `f9`、
+        #         `Ctrl+Alt+R` 與 `ctrl-alt-r`（`raw` 不參與相等性比較，
+        #         見 `HotkeySpec`）。先前比字串，重複的寫法會塞進兩組，
+        #         結果是「同一個鍵被觸發兩次」的隱患。
+        #      2. **同一顆開始鍵、不同收尾方式是合法的兩組**：
+        #         `F9@double` 與 `F9,Esc@toggle` 不是重複！只比 `spec`
+        #         的話第二筆會靜默消失（實測踩到；`config.py` 的
+        #         `apply_hotkeys_patch()` 有同一條規則，兩處必須一致 ——
+        #         不一致的症狀是「UI 存得進去，重啟後少一組」）。
+        #      3. **`~` 停用與啟用是不同狀態**：`~F9` 與 `F9,Esc` 不是重複。
+        #         少了 `enabled` 這一項，`["~F9", "F9,Esc"]` 會被合併成
+        #         「兩組都停用」—— 使用者明明啟用了一組，卻按什麼都沒反應
+        #         （而且畫面上每一列看起來都正常）。
+        sig = (spec, mode or MODE_HOLD, end, end_mode or MODE_HOLD,
+               _is_enabled_text(raw))
+        if any(sig == s for s in seen):
             continue
+        seen.append(sig)
         good.append(spec)
         modes.append(mode)
         ends.append(end)

@@ -78,6 +78,15 @@ class Status:
         self.mic_order: list[str] = []
         self.hotkey_label = ""
         self.hotkey_error: str | None = None
+        # 錄音鍵（**多組**）—— 與 Windows 版 `vibetalkie.Status` 同一個形狀。
+        # ⚠️ 這幾個欄位是新 UI 要求的（`app/ui/app.js` 讀 `s.hotkeys` /
+        #    `s.key_enabled` / `s.hotkeys_label` / `s.hotkey_warning` /
+        #    `s.key_test`）。**兩個平台共用同一份 UI**，所以欄位名要一字不差；
+        #    少一個的症狀是 UI 顯示 undefined 而後端毫無錯誤。
+        #    由 `tests/test_status_contract.py` [6] 對兩個平台一起驗。
+        self.hotkeys_label = ""          # 多組的完整標籤（含停用）
+        self.hotkey_warning: str | None = None   # 解析失敗的原因（一路傳到 UI）
+        self.key_test: dict | None = None        # 「測試」模式的狀態
         self.model_wanted = ""
         self.model_loaded = ""
         self.model_mismatch = False
@@ -130,10 +139,22 @@ class Status:
             "mic_device": self.mic_device,
             "target_online": self.target_online,
             "mic_order": self.mic_order,
-            # 錄音鍵
-            "hotkey": getattr(self.cfg, "hotkey", ""),
+            # 錄音鍵（**多組**）
+            #
+            # ⚠️ 欄位名與 Windows 版 `vibetalkie.Status.snapshot()` 一字不差 ——
+            #    兩個平台共用同一份 `app/ui/app.js`，名字不同就是靜默失敗。
+            #    `hotkey` 保留單一字串是為了相容舊 UI，真正的來源是 `hotkeys`。
+            "hotkeys": list(_effective_hotkeys(self.cfg)),
+            "key_enabled": list(_hotkey_enabled(self.cfg)),
+            "hotkey": (_effective_hotkeys(self.cfg) or [""])[0],
+            "hotkeys_label": self.hotkeys_label,
             "hotkey_label": self.hotkey_label,
             "hotkey_error": self.hotkey_error,
+            # 錄音鍵設定有問題時一路傳到 UI 顯示 —— 設定頁寫了看不懂的字串
+            # 卻沒有任何提示，是最容易讓人白費一整輪的失敗模式。
+            "hotkey_warning": self.hotkey_warning,
+            # 「測試」模式（只聽不錄）：UI 靠這個顯示「✓ 收到 F9」之類的回報
+            "key_test": self.key_test,
             "trigger_mode": getattr(self.cfg, "trigger_mode", "hold"),
             # 模型
             "model_wanted": self.model_wanted,
@@ -174,6 +195,32 @@ def config_path() -> Path:
     """設定檔路徑（與 config.py 保持一致）。"""
     import config as config_module
     return Path(getattr(config_module, "CONFIG_PATH", ROOT / "config.toml"))
+
+
+def _effective_hotkeys(cfg) -> list:
+    """實際生效的錄音鍵清單（新舊欄位並存的判定在 `Config`，這裡不重寫一份）。
+
+    ⚠️ 退回 `getattr` 是刻意的：`ui_server` 是**共用層**，不該假設 cfg 一定
+    是完整的 `Config`（測試與工具會傳輕量的物件）。判定邏輯仍然只有
+    `Config.effective_hotkeys()` 一份 —— 這裡只是「沒有那個方法時」的後備。
+    """
+    if hasattr(cfg, "effective_hotkeys"):
+        return list(cfg.effective_hotkeys())
+    one = getattr(cfg, "hotkey", "")
+    return [one] if one else []
+
+
+def _hotkey_enabled(cfg) -> list:
+    """每一組是否啟用（順序與 `_effective_hotkeys()` 一致）。
+
+    沒有 `Config.hotkey_enabled()` 時，直接照 `~` 前綴判斷 ——
+    那也是 `hotkey.DISABLED_PREFIX` 的定義，不會有第二種說法。
+    """
+    if hasattr(cfg, "hotkey_enabled"):
+        return list(cfg.hotkey_enabled())
+    import hotkey as hotkey_mod
+    return [not str(k).strip().startswith(hotkey_mod.DISABLED_PREFIX)
+            for k in _effective_hotkeys(cfg)]
 
 
 def _has_opencc() -> bool:
@@ -349,25 +396,30 @@ def make_handler(status: Status):
                 cfg.mic_names = order
                 cfg.mic_name = order[0] if order else ""
 
-            if "hotkey" in patch:
-                # ⚠️ 一定要驗證：認不得的字串**不能靜默接受**，
-                #    否則使用者以為設定生效了，實際上還在用舊鍵。
-                spec_text = str(patch["hotkey"] or "").strip()
-                try:
-                    spec = hotkey_mod.parse(spec_text)
-                except hotkey_mod.HotkeyError as exc:
-                    return self._json({"error": str(exc)}, 400)
-                # 這個平台的鍵碼表要認得這顆鍵（Windows 用 VK、mac 用 Carbon）
-                try:
-                    import keys as keys_mod
-                    keys_mod.name_to_code(
-                        _main_key_from_spec(spec, hotkey_mod))
-                except Exception as exc:                # noqa: BLE001
-                    return self._json(
-                        {"error": f"這個平台不支援這個按鍵：{exc}"}, 400)
-                cfg.hotkey = spec_text
-                status.hotkey_label = spec.label
+            # 錄音鍵：**多組**，而且每一組可以帶自己的觸發方式與結束鍵。
+            #
+            # ⚠️ 驗證與 Windows 版**共用同一份**（`config.apply_hotkeys_patch`）。
+            #    這裡原本只認單一字串 `hotkey`，而且會用
+            #    `keys.name_to_code()` 去驗「本平台認不認得這顆鍵」——
+            #    那個驗證在**測試環境**（Windows 上跑 mac 的程式）會誤判，
+            #    因為 `name_to_code()` 回的是**執行這支程式的那個平台**的鍵碼。
+            #    真正的把關是 `hotkey.parse_binding()`（平台無關）＋
+            #    `keys.py` 提供候選清單給 UI 選。
+            if "hotkeys" in patch or "hotkey" in patch:
+                raw = patch.get("hotkeys", None)
+                if raw is None:
+                    one = str(patch.get("hotkey") or "").strip()
+                    raw = [one] if one else []
+                err = config_module.apply_hotkeys_patch(cfg, raw)
+                if err:
+                    return self._json({"error": err}, 400)
+                bind = hotkey_mod.bindings(
+                    list(_effective_hotkeys(cfg)),
+                    default_mode=getattr(cfg, "trigger_mode", "hold"))
+                status.hotkey_label = bind.label
+                status.hotkeys_label = bind.label
                 status.hotkey_error = None
+                status.hotkey_warning = None
 
             if "trigger_mode" in patch:
                 # ⚠️ 用 `TRIGGER_MODES_VALUES`（字串集合），**不是** `TRIGGER_MODES`。
@@ -471,12 +523,15 @@ def make_handler(status: Status):
     return Handler
 
 
-def _main_key_from_spec(spec, hotkey_mod) -> str:
-    """`HotkeySpec` → 本平台的主鍵名稱（給 keys.name_to_code 驗證用）。"""
-    name = (hotkey_mod.VK_TO_NAME.get(spec.vk) or "").lower()
-    if spec.require_e0 and name in ("ctrl", "shift", "alt"):
-        name = "right" + name
-    return name
+# `_main_key_from_spec()` 刪掉了（整合時）。
+#
+# 它把 `HotkeySpec`（那時內部是 **Windows VK 碼**）翻譯成 mac 的主鍵名稱，
+# 只為了餵給 `keys.name_to_code()` 做驗證。那正是「共用層講 VK、平台層
+# 只好自己翻譯」的症狀 —— 也因為它依賴**執行平台的鍵碼表**，在
+# 「Windows 上跑 mac 的程式」這種情況下會給出錯的答案。
+#
+# 現在 `HotkeySpec` 自己就講 canonical 名稱（見 app/core/hotkey.py），
+# 驗證由 `hotkey.parse_binding()` 負責（平台無關），這個翻譯層整段不需要了。
 
 
 # ---------------------------------------------------------------- 模型狀態

@@ -339,6 +339,88 @@ class Config:
         return out
 
 
+def start_key_text(entry: str) -> str:
+    """從一筆設定抽出「開始鍵」的寫法（去掉 `@模式` 與 `,結束鍵`）。
+
+    只有舊欄位 `hotkey` 需要這個 —— 它只認得單一顆鍵。
+
+    ⚠️ 順序：`F9,Esc@double` 要先切掉 `@模式` 再切 `,結束鍵`；
+    反過來的話 `F9,Esc@double` 會先被 `,` 切掉尾巴，卻留著 `@double`
+    （實測就是這個順序寫錯，舊欄位變成 `F9@double`）。
+
+    ⚠️ 放在 `config.py` 而不是 `vibetalkie.py`：兩個平台都要用，
+    而兩份的漂移症狀是「舊欄位存成 `F9@double`」—— 那正是上面那個 bug。
+    """
+    head = str(entry or "").split(hotkey.BINDING_SEP)[0]
+    return head.split(hotkey.MODE_SEP)[0].strip()
+
+
+def apply_hotkeys_patch(cfg, raw) -> str | None:
+    """把 UI 送來的 `hotkeys` 清單套進設定。**回傳錯誤訊息，成功回 None。**
+
+    為什麼放在這裡而不是各自的 HTTP handler：兩個平台（Windows 的
+    `vibetalkie.py` 與 mac 的 `ui_server.py`）都要用同一套驗證 ——
+    各寫一份就會漂移，而漂移的症狀是「同一筆設定在 Windows 存得進去、
+    在 mac 被拒」，使用者完全無法理解。
+
+    驗證規則：
+
+      · 每一筆都要 `hotkey.parse_binding()` 過得去
+        （開始鍵、結束鍵、**兩邊的行為**都驗）
+      · 去重比**解析後**的規格（`F9` 與 `f9` 是同一組）
+      · 空清單是**拒絕**，不是「等於沒設」—— 接受的話會變成
+        「一個錄音鍵都沒有」→ 按什麼都不會錄音，而畫面看起來儲存成功了
+    """
+    if not isinstance(raw, list):
+        return 'hotkeys 必須是陣列（例如 ["RightCtrl", "F9,Escape"]）'
+    keys: list[str] = []
+    seen: list = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        try:
+            start, smode, end, emode = hotkey.parse_binding(
+                text, getattr(cfg, "trigger_mode", hotkey.MODE_HOLD))
+        except hotkey.HotkeyError as exc:
+            return f"錄音鍵無法解析：{exc}"
+        # ⚠️ 去重要比**整筆描述**（開始鍵＋開始行為＋結束鍵＋結束行為），
+        #    不是只比開始鍵的規格。
+        #
+        #    實際踩到的 bug：先前只比 `spec`，於是底下這些**合法**的組合
+        #    會被當成重複而**靜默丟掉**（使用者只看到「設了兩組，存完只剩
+        #    一組」，而且完全沒有錯誤訊息）：
+        #
+        #        F9@double  ＋  F9,Esc@toggle     （同一顆開始鍵、不同收尾）
+        #        F9         ＋  F9,Esc
+        #        F9@double  ＋  F9@toggle
+        #
+        #    但「寫法不同、語意相同」的仍然要去重：`F9`／`f9`、
+        #    `Ctrl+Alt+R`／`ctrl-alt-r`／`Alt+Ctrl+R` —— 那些解析後
+        #    每一項都一樣，所以整筆描述相等（見 `HotkeySpec` 的
+        #    `compare=False` on `raw`）。
+        #
+        # ⚠️ `enabled` 也要納入：`~F9` 與 `F9,Esc` **不是**重複，
+        #    一個是停用、一個是啟用。少了它，`["~F9", "F9,Esc"]` 會被
+        #    合併成兩組都停用 —— 使用者明明啟用了一組卻按什麼都沒反應，
+        #    而畫面上每一列看起來都正常。
+        #    這條規則與 `hotkey.bindings()` 裡的去重**必須一致**，
+        #    不一致的症狀是「UI 存得進去，重啟後少一組」。
+        sig = (start, smode or hotkey.MODE_HOLD,
+               end, emode or hotkey.MODE_HOLD,
+               not text.startswith(hotkey.DISABLED_PREFIX))
+        if any(sig == s for s in seen):
+            continue
+        seen.append(sig)
+        keys.append(text)
+    if not keys:
+        return "至少要有一個錄音鍵"
+    cfg.hotkeys = keys
+    # 兼容舊欄位：只留**開始鍵**（去掉 `@模式` 與 `,結束鍵`）
+    cfg.hotkey = start_key_text(keys[0])
+    return None
+
+
 def _toml_value(v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"

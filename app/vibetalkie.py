@@ -198,16 +198,11 @@ class Status:
         }
 
 
-def start_key_text(entry: str) -> str:
-    """從一筆設定抽出「開始鍵」的寫法（去掉 `@模式` 與 `,結束鍵`）。
-
-    只有舊欄位 `hotkey` 需要這個 —— 它只認得單一顆鍵。
-    ⚠️ 順序：`F9,Esc@double` 要先切掉 `@模式` 再切 `,結束鍵`；
-    反過來的話 `F9,Esc@double` 會先被 `,` 切掉尾巴，卻留著 `@double`
-    （實測就是這個順序寫錯，舊欄位變成 `F9@double`）。
-    """
-    head = str(entry or "").split(hotkey.BINDING_SEP)[0]
-    return head.split(hotkey.MODE_SEP)[0].strip()
+# `start_key_text()` **搬到 `config.py` 了** —— 兩個平台（Windows 的
+# `vibetalkie.py` 與 mac 的 `ui_server.py`）都要用，各留一份就會漂移
+# （漂移的症狀正是它 docstring 記的那個 bug：舊欄位變成 `F9@double`）。
+# 這裡保留同名別名，讓既有呼叫端與測試不必改。
+start_key_text = config_module.start_key_text
 
 
 # ---------------------------------------------------------------- 裝置解析
@@ -564,42 +559,18 @@ def make_handler(status: Status):
             # （`F9@double`、`F9,Escape`、`Ctrl+Alt+R,Escape@toggle`；
             # 沒寫 `@` 就用全域 trigger_mode）。
             # 也接受舊的單一字串 `hotkey`（舊版 UI／手寫的呼叫端）。
+            #
+            # ⚠️ 驗證邏輯在 `config.apply_hotkeys_patch()` —— **兩個平台共用
+            #    同一份**。在這裡自己寫一份的症狀是「同一筆設定在 Windows
+            #    存得進去、在 mac 被拒」，而使用者完全無法理解為什麼。
             if "hotkeys" in patch or "hotkey" in patch:
                 raw = patch.get("hotkeys", None)
                 if raw is None:
                     one = str(patch.get("hotkey") or "").strip()
                     raw = [one] if one else []
-                if not isinstance(raw, list):
-                    return self._json({"error": "hotkeys 必須是陣列（例如 "
-                                                '["RightCtrl", "F9,Escape"]）'}, 400)
-                keys: list[str] = []
-                seen: list = []
-                for item in raw:
-                    text = str(item or "").strip()
-                    if not text:
-                        continue
-                    try:
-                        # 驗證開始鍵、結束鍵**與兩邊的行為**；生效由 daemon 解析
-                        spec, _smode, _end, _emode = hotkey.parse_binding(
-                            text, cfg.trigger_mode)
-                    except hotkey.HotkeyError as exc:
-                        return self._json({"error": f"錄音鍵無法解析：{exc}"}, 400)
-                    # ⚠️ 去重要比**解析後**的規格，不是原始字串：`F9` 與 `f9`
-                    # 是同一組，`Ctrl+Alt+R` 與 `ctrl-alt-r` 也是。只比字串
-                    # 的話清單裡會出現兩個看起來一樣、其實重複的鍵，
-                    # 而 UI 的「已經在清單裡了」判斷也會失效。
-                    if any(spec == s for s in seen):
-                        continue
-                    seen.append(spec)
-                    keys.append(text)
-                # ⚠️ 空清單是**拒絕**而不是「等於沒設」。接受的話會變成
-                # 「一個錄音鍵都沒有」→ 使用者按什麼都不會錄音，
-                # 而且畫面上看起來儲存成功了。
-                if not keys:
-                    return self._json({"error": "至少要有一個錄音鍵"}, 400)
-                cfg.hotkeys = keys
-                # 兼容舊欄位：只留**開始鍵**（去掉 `@模式` 與 `,結束鍵`）
-                cfg.hotkey = start_key_text(keys[0])
+                err = config_module.apply_hotkeys_patch(cfg, raw)
+                if err:
+                    return self._json({"error": err}, 400)
 
             if "trigger_mode" in patch:
                 val = str(patch["trigger_mode"])

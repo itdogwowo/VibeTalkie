@@ -48,6 +48,30 @@ def fields_used_by_ui() -> set[str]:
     return {u for u in used if u not in {"length", "map", "filter", "join", "textContent"}}
 
 
+def check_snapshot(snap: dict, label: str) -> None:
+    """一個 `snapshot()` 物件與 app.js 的欄位契約。
+
+    **兩個平台共用同一份 app/ui/，所以這個檢查要能重複套用在兩邊** ——
+    抽成函式而不是複製兩段，理由與 `snapshot()` 本身一樣：兩份檢查會漂移，
+    而漂移的那一邊就是「沒被驗到的平台」。
+    """
+    import json
+    used = sorted(fields_used_by_ui())
+    missing = [f for f in used if f not in snap]
+    check(f"[{label}] 沒有缺少的欄位", not missing,
+          f"缺少 {missing}" if missing else f"{len(used)} 個欄位全部具備")
+    try:
+        json.dumps(snap, ensure_ascii=False)
+        check(f"[{label}] 可 JSON 序列化", True)
+    except Exception as exc:                           # noqa: BLE001
+        check(f"[{label}] 可 JSON 序列化", False, f"{type(exc).__name__}: {exc}")
+    for key, typ in (("state", str), ("level", (int, float)),
+                     ("presses", int), ("history", list)):
+        check(f"[{label}] {key} 是 {getattr(typ, '__name__', typ)}",
+              isinstance(snap.get(key), typ),
+              f"實際 {type(snap.get(key)).__name__}")
+
+
 def main() -> int:
     try:
         import ctypes
@@ -98,7 +122,42 @@ def main() -> int:
 
     print("\n[5] 警告欄位預設為 None（沒有警告時 UI 要能正確隱藏）")
     check("vendor_warning 預設 None", snap.get("vendor_warning") is None)
-    check("mic_warning 預設 None", snap.get("mic_warning") is None)
+    # ⚠️ 這一條**只對 Windows 成立**。macOS 的 `mic_warning` 一定要有內容
+    #    （AGENTS.md §8.7：mac 的 AVAudioEngine 只能用系統預設輸入裝置，
+    #    「麥克風優先順序」在那裡無效，不講的話使用者會排了半天順序然後
+    #    發現完全沒作用）。所以 mac 的斷言在 [7]。
+    check("mic_warning 預設 None（Windows）", snap.get("mic_warning") is None)
+
+    # ------------------------------------------------------------------
+    # 兩個平台共用同一份 app/ui/ —— 所以契約要對**兩邊**都成立。
+    #
+    # ⚠️ 為什麼要在這裡驗 mac 的 `ui_server.Status`：它的 `snapshot()` 是
+    #    **另一份實作**（檔案不同、class 不同）。分成兩份的症狀是
+    #    「Windows 的設定頁正常、mac 的整片 undefined」，而兩邊都不會報錯。
+    #    實際踩過的就是這一種（見 AGENTS.md §8.7 的「形狀也是契約」）。
+    # ------------------------------------------------------------------
+    print("\n[6] macOS 的 ui_server.Status 也要滿足同一份欄位契約")
+    mac_snap = None
+    try:
+        from ui_server import Status as MacStatus
+        mac_snap = MacStatus(Config(), platform="macos").snapshot()
+        check_snapshot(mac_snap, "macos")
+    except Exception as exc:                           # noqa: BLE001
+        check("[macos] snapshot() 可呼叫", False, f"{type(exc).__name__}: {exc}")
+
+    if mac_snap is not None:
+        print("\n[7] mac 平台的警告欄位（與 Windows 的語意不同）")
+        check("macos 的 mic_warning 必須有內容（§8.7 的硬規則）",
+              mac_snap.get("mic_warning") not in (None, ""),
+              repr(mac_snap.get("mic_warning")))
+        check("macos 的 vendor_warning 是 None（不假裝有）",
+              mac_snap.get("vendor_warning") is None,
+              repr(mac_snap.get("vendor_warning")))
+        check("macos 的 bt_warning 是 None（不假裝有）",
+              mac_snap.get("bt_warning") is None,
+              repr(mac_snap.get("bt_warning")))
+        check("macos 的 platform 欄位是 'macos'",
+              mac_snap.get("platform") == "macos", repr(mac_snap.get("platform")))
 
     print("\n" + "=" * 68)
     if failures:
