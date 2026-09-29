@@ -46,6 +46,12 @@
 > 目的是先有每天能用的東西。`app/` 的程式碼**不代表 P4 的決定**；
 > 若最後選 Rust，`tools/p1/` 與 `app/` 的實測結論與文件仍然有效。
 
+> 📌 **翻譯已經被評估過一次（`docs/spike/translation.md`）。**
+> 結論：**演算法很近，資源很遠。** 兩段式（ASR → Opus-MT）總延遲約 384 ms
+> （門檻 1500 ms），但要多背 169 MB 模型檔與約 375 MB RSS，
+> 而現況閒置記憶體**已經超標**。**§1「v1 不做翻譯」的決定沒有改變** ——
+> 那是產品決策，不是留給 AI「順手加」的空缺。
+
 **不要跳關。** 沒跑完 P4，不准寫 `src-tauri/` 或正式產品程式碼。
 （`app/` 是例外，理由如上。）
 
@@ -76,7 +82,16 @@ VibeTalkie/
 │  │  ├─ recorder.py      #   擷取封裝（自動停止、音量分析）
 │  │  ├─ record_wav.py    #   winmm waveIn 底層
 │  │  ├─ keycode_logger.py#   Raw Input 底層（ptt.py 從這裡匯入）
-│  │  └─ textin.py        #   文字注入：剪貼簿貼上／逐字輸入
+│  │  ├─ textin.py        #   文字注入：剪貼簿貼上／逐字輸入
+│  │  │
+│  │  │  ── 以下是 macOS 實作（見下方說明）──
+│  │  ├─ keys.py          #   可攜鍵名 ↔ 平台鍵碼（VK / Carbon keycode）
+│  │  ├─ mac_keylistener.py # CGEventTap 監聽（取代 keycode_logger）
+│  │  ├─ mac_recorder.py  #   AVAudioEngine 錄音（取代 record_wav）
+│  │  ├─ mac_textin.py    #   NSPasteboard + Cmd+V（取代 textin）
+│  │  ├─ autosetup.py     #   缺套件／缺模型時自動下載安裝
+│  │  └─ ui_server.py     #   設定頁面的 HTTP server（兩平台共用 UI）
+│  ├─ mac_vibetalkie.py   # ★ macOS 進入點（狀態機，對應 ptt.py）
 │  └─ ui/
 │     ├─ index.html       # 分頁結構（**不要放 inline JS**，見 §8.5）
 │     ├─ style.css        # 樣式
@@ -533,6 +548,250 @@ for ($i=0; $i -lt $b.Length; $i++) {
 所有進入點都必須先 `SetConsoleOutputCP(65001)` + `reconfigure(encoding="utf-8")`。
 （`launch.py` 曾經漏掉，已補。）
 
+---
+
+## 8.7 macOS 實作（**與 §8.2 規則 2 的關係必讀**）
+
+進入點是 `app/mac_vibetalkie.py`（狀態機與 §5 完全一致，只是換掉平台層）。
+
+### 模組對應
+
+| 職責 | Windows | macOS |
+|---|---|---|
+| 按鍵監聽 | `keycode_logger.py`（Raw Input） | `mac_keylistener.py`（CGEventTap） |
+| 錄音 | `record_wav.py`（winmm waveIn） | `mac_recorder.py`（AVAudioEngine） |
+| 文字注入 | `textin.py`（SendInput） | `mac_textin.py`（NSPasteboard + Cmd+V） |
+| 鍵名對照 | VK 碼（`hotkey.py`） | `keys.py`（Carbon keycode） |
+| **設定頁面** | `vibetalkie.py` 內建 HTTP server | **`ui_server.py`（共用同一份 `app/ui/`）** |
+
+### 設定頁面（兩個平台共用同一份 UI）
+
+UI 是純靜態檔（`app/ui/index.html` + `app.js` + `style.css`，943 行），
+macOS 版由 **`app/core/ui_server.py`** 服務，預設 `http://127.0.0.1:8756/`。
+
+```bash
+python3 app/mac_vibetalkie.py            # 會自動開瀏覽器
+python3 app/mac_vibetalkie.py --no-ui    # 純命令列模式
+python3 app/mac_vibetalkie.py --port 9000 --no-browser
+```
+
+也可以在 Finder **雙擊 `啟動 VibeTalkie.command`** —— 那個入口直接呼叫
+`app/mac_vibetalkie.py`（**不經過 `launch.py`**，因為 launch.py 是
+跨平台啟動器，macOS 在它眼中仍是「尚未支援」）。
+
+可以在頁面上改：**錄音鍵**（含預設清單）、**觸發方式**（hold/toggle/double）、
+輸出模式、簡繁轉換、模型下載與切換。改完寫進 `config.toml`。
+
+> ⚠️ **`snapshot()` 是 UI 的契約，兩個平台各自實作、各自要驗證。**
+> mac 版由 `tests/test_mac_ui_contract.py` 檢查（讀 `app.js` 抓出實際用到的
+> `s.<欄位>`，比對 snapshot 有沒有全部提供）。Windows 版是
+> `tests/test_status_contract.py`。
+>
+> 少一個欄位的症狀是「UI 顯示 undefined，而後端毫無錯誤」——
+> 這種漂移用眼睛看不出來。
+
+> 🔴 **HTTP 回應的「形狀」也是契約，不只是欄位。**
+>
+> **實際踩到：** `/api/models` 我自作主張回了一個不同的結構：
+>
+> ```
+> 我回的：  {"installed": [...], "catalog": [...], "current": "..."}
+> UI 要的： {"models": [{name, title, state, download, active, supported, ...}]}
+> ```
+>
+> 後果：`app.js` 讀 `d.models` 得到 `undefined` → **模型分頁整片空白**，
+> 而且 HTTP 200、JSON 合法、後端毫無錯誤訊息。
+>
+> 同一個 commit 裡我還把 `snapshot().downloads` 寫死成 `[]`，
+> 於是「按了下載完全沒反應」——其實下載有在跑，只是 UI 看不到進度
+> （`app.js` 靠這個欄位畫進度條並在完成時自動刷新清單）。
+>
+> **兩個平台共用同一份 UI，所以回應格式不是實作細節。**
+> `tests/test_mac_api_contract.py` 專門驗證這件事：它從 `app.js`
+> 抓出實際呼叫的端點、以及 `MODEL_STATE` 認得的狀態值，
+> 再比對後端的回應形狀。**要對齊 Windows 版的做法，不要自己設計格式。**
+
+> 📌 **實作時踩到的三個坑：**
+> 1. `TRIGGER_MODES` 是**給 UI 顯示的 dict 清單**（含 label/note），
+>    不是字串集合。拿它來驗證字串會**永遠不相等**，症狀是
+>    「合法的 `toggle` 被回『未知的觸發方式』」。要用
+>    **`TRIGGER_MODES_VALUES`** / **`MIC_STREAM_VALUES`**。
+> 2. `ui_server.py` 直接執行時 `app/core` 不在 `sys.path`（那是「被 import
+>    時」才有的待遇），少了自建路徑會得到 `ModuleNotFoundError: config`。
+> 3. **狀態值必須轉小寫。** `app.js` 的 `STATE_TEXT` 用小寫鍵
+>    （`idle`/`recording`/…），但狀態機內部用大寫（`IDLE`/`RECORDING`）。
+>    Windows 版在 `Status.on_state` 有 `state.lower()`，mac 版漏了 →
+>    UI 顯示「未知」，而且狀態燈的 CSS class 也對不上。
+>    **共用同一份 UI 時，這種「一邊有轉、一邊沒轉」會變成平台專屬怪症狀。**
+>
+>    同理：`mic_device` **不能是空字串** —— `app.js` 的判斷是
+>    `s.mic_device != null`，空字串會通過，畫面就顯示成「device 」（空的）。
+>
+>    `tests/test_mac_ui_contract.py` 會從 `app.js` **實際解析出**
+>    `STATE_TEXT` 的鍵來驗證（不自己抄一份清單 —— 抄一份就會漂移，
+>    而那正是這個 bug 的成因）。
+
+### 🔴 進入點必須自己擋 Python 版本（不能只靠 launch.py）
+
+**實際踩到：** 使用者的 `python3` 是 conda 的 3.10（PATH 最前面），
+直接跑 `python3 app/mac_vibetalkie.py` 會得到：
+
+```
+ModuleNotFoundError: No module named 'tomllib'      ← 3.11 才進標準庫
+```
+
+那個錯誤指向 import，**完全看不出「你只是用錯 Python」**。
+而 `launch.py` 明明已經有「找合格的 Python 並重新執行」的邏輯 ——
+只是被繞過了（使用者不會知道要先跑啟動器）。
+
+所以 `mac_vibetalkie.py` 在最前面（**早於任何需要 3.11+ 的 import**）
+呼叫 `launch.reexec_if_python_too_old(自己)`。
+`reexec_if_python_too_old` 因此接受一個 `script` 參數 ——
+否則會把使用者丟回 `launch.py`，然後被回「macOS 尚未支援」。
+
+`tests/test_launch_python.py` 會用**真的舊解譯器**跑一次驗證
+（不是只檢查原始碼裡有沒有那行字）。
+
+### ⚠️ §8.2 規則 2 在 macOS 上**做不到**（已實測）
+
+> 規則 2：必須能分辨「這顆鍵是不是目標裝置送的」。
+
+Windows 靠 Raw Input 的 `hDevice`。**macOS 的 CGEventTap 沒有等價物** ——
+實測結果（用同一支程式分別按藍牙麥克風錄音鍵與實體鍵盤）：
+
+| 欄位 | 藍牙裝置 | 實體鍵盤 |
+|---|---|---|
+| `kCGKeyboardEventKeyboardType` | 40 | 40 |
+| `kCGEventSourceUserData` | 0 | 0 |
+| `kCGEventSourceStateID` | 1 | 1 |
+| `kCGTabletEventDeviceID` | 0 | 0 |
+
+**四個候選欄位全部相同 → 無法區分。**
+（IOKit 的 `IOHIDManager` 能看到裝置身分，但收不到事件；實測需要
+「輸入監控」權限且非特權行程拿不到，不列為可行路徑。）
+
+**mac 版的策略：不做裝置辨識，靠「錄音鍵可自由設定」達到同樣效果。**
+這與 `hotkey.py` 開頭的設計原則一致（「完全脫離硬體綁定」）。
+→ **在 mac 上請不要用 `RightCtrl` 當錄音鍵**（會與實體鍵盤衝突且無法過濾），
+建議 `F9` 或 `Ctrl+Shift+Space`。
+
+### ⚠️ 麥克風「優先順序」在 macOS 上無效（必須講出來）
+
+macOS 的 `AVAudioEngine` **只能用系統預設輸入裝置** —— 程式無法指定
+要用哪一支（那由「系統設定 → 聲音 → 輸入」決定）。
+
+但設定頁有一個「麥克風優先順序」清單（那是為 Windows 做的）。
+在 mac 上那個清單**可以編輯但不會生效**。
+
+**所以 `mic_warning` 必須有內容**（不是 None）—— UI 有現成的警告框
+（`app.js` 收集 `mic_warning` / `bt_warning` / `vendor_warning` 顯示），
+用那個管道告訴使用者「要換麥克風請到系統設定」。
+**不講的話，使用者會排了半天順序然後發現完全沒作用。**
+
+`vendor_warning` / `bt_warning` 則維持 `None`（mac 真的沒有那些偵測，
+**不假裝有**）。`tests/test_mac_ui_contract.py` 對這兩類有不同斷言。
+
+### 📌 裝置列舉：用 `system_profiler`，不要用 pyobjc 的 CoreAudio
+
+設定頁的下拉選單需要**列出所有麥克風**。第一版只回一個
+「系統預設輸入裝置」→ 使用者說「**裝置現在沒有列出來**」。
+
+列舉走 `system_profiler SPAudioDataType`（macOS 內建、輸出穩定），
+**不要用 pyobjc 的 `CoreAudio` 綁定** —— 它的簽章在不同版本間不一致，
+而且錯誤訊息完全指不到真正的問題：
+
+```
+ValueError: argument 4 must be None or objc.NULL      ← 位址要 tuple
+TypeError: depythonifying struct, got no sequence     ← 又說要 struct
+```
+
+解析時的四個坑（都實測踩到，見 `tests/test_mac_devices.py`）：
+
+1. 取樣率的鍵是 **`Current SampleRate`**（沒有空格）—— 寫成
+   `Current Sample Rate` 就永遠是 0。
+2. 清單**同時包含輸出裝置**（喇叭、HDMI）→ 要按 `Input Channels` 過濾。
+3. 但**某些虛擬音訊裝置真的有 `Input Channels`**（雙向的虛擬裝置）
+   → 只能靠 **`Transport: Virtual`** 分辨，光看通道數分不出來。
+4. 「預設裝置」要看 **`Default Input Device: Yes`**，不是取第一支。
+   顯示「目前使用的麥克風」時也要挑那一支（取 `devs[0]` 會顯示錯的）。
+
+有 30 秒快取（`system_profiler` 約 0.3–0.6 秒，設定頁不該每次重打）。
+
+### 權限（TCC）
+
+| 權限 | 用途 | 沒給的症狀 |
+|---|---|---|
+| **輔助使用** | CGEventTap 監聽 + 送出 Cmd+V | 啟動時就報錯（有做檢查） |
+| **麥克風** | AVAudioEngine 錄音 | 錄到 0 bytes |
+
+改完權限必須 **⌘Q 完全結束再重開** 該程式，權限才會生效。
+
+> ⚠️ **權限無法自動化。** macOS 不提供程式化授權（TCC 的設計就是如此），
+> 所以這一項一定要使用者自己動手。**但相依套件與模型會自動處理**（見下）。
+
+### 自動補齊相依套件與模型（`app/core/autosetup.py`）
+
+**每次啟動都會檢查一次**，缺什麼就補什麼，補完直接繼續（不用重跑）：
+
+| 缺什麼 | 自動處理 |
+|---|---|
+| Python 套件（sherpa-onnx / numpy / opencc / pyobjc×3） | pip → 失敗則退回 `tools/p1/fetch_wheels.py` |
+| ASR 模型（163 MB） | 呼叫 `tools/p1/fetch_model.py --get` |
+
+- 一律裝到 **`third_party/`**（gitignored），不污染使用者的 site-packages。
+- 東西齊的時候**只花約 0.3 秒**（純 import + probe），不會每次重裝。
+- `--no-install` 可關掉（公司電腦／離線環境）。
+- `--check` 只檢查不啟動，並列出每個相依的狀態。
+
+> 🔴 **判斷「有沒有裝」不能只看 import —— 要真的動用它（probe）。**
+>
+> 實際的失敗模式：套件 import 成功，但**傳遞依賴缺了，用到才爆**。
+> 例如 `opencc-python-reimplemented` 需要 `pkg_resources`（setuptools）。
+> 只檢查 import 會把它判成「已就緒」，然後在**使用者第一次講話時**
+> 才失敗 —— 最糟的時機，而且訊息通常指向別的地方。
+>
+> 所以 `PACKAGES` 的每個項目都是 `(PyPI 名, probe)`：
+> `check_one()` 分三層判斷（import 不到 / import 到但 probe 失敗 / 可用），
+> probe 失敗一律視為缺少 → 觸發安裝修復。
+> `tests/test_autosetup.py` 有對照組驗證這件事。
+
+> 📌 **`fetch_wheels.py` 修過一個潛伏的 bug。**
+> 它的 `PLATFORM_PRIORITY` 原本寫死 `("win_amd64", "win32", "any")`，
+> 所以在 macOS / Linux 上 `pick_wheel()` **永遠回 None** ——
+> 症狀是「PyPI 明明有 wheel，工具卻說找不到」。
+> 現在由 `platform_patterns()` 依平台決定，而且參數可注入
+> （這樣三個平台的分支才都測得到，見 `tests/test_wheel_platform.py`）。
+> **Windows 的優先序與修改前完全相同。**
+
+### 🔴 三個會 segfault 的地雷（都實際踩過，不要「簡化」掉）
+
+1. **`AVAudioConverter` 在 pyobjc 下會 segfault。**
+   `mac_recorder.py` 因此自己做線性插值重採樣。
+   最小隔離測試：拿掉 converter → 回呼正常（19 次 / 83790 frames）；加回去 → 崩。
+2. **`floatChannelData()` 回傳的是 tuple，不是 ctypes 指標。**
+   `t[0]` 是 `objc.varlist`，要用 **`as_buffer(count)`**（count 是樣本數，
+   不給會 `TypeError`）。用 `raw[0][:n]` 切片會越界讀取 → segfault。
+3. **tap 的 block 必須保留參照**（`self._tap_block`）。
+   被 GC 回收而原生層還握著指標 → segfault。
+
+另外：`installTapOnBus` **不接受**與硬體不同的格式
+（指定 16 kHz 會得到 `Failed to create tap due to format mismatch`），
+所以 tap 用原生格式（實測 44.1 kHz / 2ch / Float32），轉換自己做。
+
+### 📌 實測：這支麥克風的正常訊號只有 0.3% FS
+
+mac 內建麥克風講話時峰值實測 **82–110（0.25–0.34% FS）**。
+**不要用「峰值大小」當判斷麥克風好不好的門檻** —— 200 會誤報正常語音。
+`--test-mic` 的判準是「輸出內容像不像話」（長句且連貫 vs 空字串／極短），
+訊號強度只當附註。
+
+### 已知問題（尚未修，mac 與 Windows 都有）
+
+**`config.toml` 的 `language` 完全沒有作用。**
+`speech_engine._build()` 把 `language="auto"` 寫死，而 `ptt.py` 呼叫
+`transcribe()` 時也沒傳。實測 `zh` / `yue` / `auto` 三種設定輸出**逐字相同**。
+好在 `auto` 對粵語有效，所以不影響使用，但這個設定值是騙人的。
+
 
 
 ---
@@ -551,7 +810,32 @@ python tests/test_bandwidth.py        # 頻寬判定器（會決定準確率門�
 python tests/test_mic_stream.py       # 串流模式、緩衝區回收、裝置復歸
 python tests/test_config_api.py       # /api/config 欄位契約與驗證
 python tests/test_trigger.py          # 錄音鍵：多組＋左右側＋每組自己的觸發方式
+python tests/test_launch_python.py    # 啟動器的 Python 自動尋找（挑最舊合格版／防無限迴圈）
+python tests/test_wheel_platform.py   # wheel 平台選擇（mac/windows/linux 三分支都測）
+python tests/test_autosetup.py        # 相依自動安裝（偵測／--no-install／依賴展開）
 ```
+
+整合之後另外多了這幾支（**任何平台都能跑，不需要 pyobjc**）：
+
+```powershell
+python tests/test_hotkey_names.py     # canonical 名稱契約（名稱／側別／平台鍵碼）
+python tests/test_trigger_engine.py   # 觸發引擎（平台無關，直接餵 Event）
+python tests/test_mac_import.py       # mac 模組的可載入性（頂層不碰 pyobjc）
+```
+
+**macOS 專用**（需要 pyobjc，見 §8.7）：
+
+```bash
+PYTHONPATH=<pyobjc 目錄> python tests/test_mac_keys.py      # 鍵名對照＋熱鍵比對（42 項）
+PYTHONPATH=<pyobjc 目錄> python tests/test_mac_trigger.py   # hold/toggle/double＋設定熱重載
+PYTHONPATH=<pyobjc 目錄> python tests/test_mac_e2e.py       # 真端到端（合成按鍵→錄音→ASR→注入）
+python tests/test_mac_devices.py                            # 音訊裝置列舉（解析 system_profiler）
+```
+
+`test_mac_ui_contract.py` 與 `test_mac_api_contract.py` 不需要 pyobjc
+（`ui_server` 只用標準函式庫），它們驗證 mac 的 `snapshot()` 與
+HTTP 回應形狀有沒有符合 `app/ui/app.js` 的期待 ——
+**兩個平台共用同一份 UI，所以兩邊都要各自驗證契約**。
 
 `test_status_contract.py` 會去讀 `app/ui/app.js`，檢查 UI 引用到的每個
 `s.<欄位>` 都存在於 `snapshot()` 的回傳裡。
