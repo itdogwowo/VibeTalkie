@@ -911,6 +911,11 @@ HTTP 回應形狀有沒有符合 `app/ui/app.js` 的期待 ——
 ### 其他
 
 - **小步 commit**，一次一件事。commit message 用 `type: 描述`（`feat` / `fix` / `docs` / `chore` / `spike`）。
+- **測試不准動使用者的 `config.toml`。** 自己的設定自己存暫存檔
+  （`cfg.save = lambda path=None: Config.save(cfg, TMP)`，見 `test_config_api.py`）。
+  實測踩到：`test_models_api.py` 的「切換模型」會讓 handler 寫到**真的**
+  `config.toml` —— 跑一次測試就改掉使用者選的模型，而且與常駐程式搶同一個檔案
+  （症狀是**偶爾紅、重跑就過**，最難查的那一種；間歇性紅燈會訓練人忽略紅燈）。
 - **TDD**：先寫失敗的測試，再寫最小實作。音訊／ASR 模組以「餵 WAV → 斷言文字」為測試形式。
 - **YAGNI**：不為想像中的需求加抽象。雲端 ASR、多引擎只在 `SpeechEngine` 介面留位置，v1 不實作。
 - **不要 push。** push 前必須逐次取得使用者同意；`force push` 要另外同意。
