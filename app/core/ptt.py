@@ -71,16 +71,21 @@ from speech_engine import (  # noqa: E402
     to_traditional,
 )
 from textin import inject_text  # noqa: E402
+import trigger  # noqa: E402  （平台無關的觸發狀態機；兩個平台共用同一顆）
 
 HWND_MESSAGE = wintypes.HWND(-3)
 VK_CONTROL = 0x11
 RI_KEY_E0 = 0x02          # 右側修飾鍵（Right Ctrl 的判別依據）
 
 # ⚠️ 「同一家族但 VK 不同的鍵要視為相等」與左右側判定，現在都住在
-# `hotkey.py`（`vk_matches()` / `spec_hit()` / `event_side()`）。
+# `hotkey.py`（`spec_hit()` / `side_of()` / `_vk_to_name_side()`）。
 # 原本這裡自己有一份 `_VK_FAMILIES`，但支援**多顆錄音鍵**之後需要
 # 「這顆鍵命中了哪幾組、每一組的修飾鍵條件是否都成立」的完整語意，
 # 兩份實作一定會漂移 —— 所以單一真相來源放在 hotkey.py。
+#
+# ⚠️ 觸發**狀態機**（hold/toggle/double、配對、停用、測試模式）則在
+# `app/core/trigger.py`：那部分與 Windows 完全無關，mac 版共用同一顆。
+# 這一支只負責把 Raw Input 事件轉成 `trigger.Event`。
 
 
 class PttDaemon:
@@ -119,18 +124,12 @@ class PttDaemon:
         #    已經是名稱（見 app/core/hotkey.py），不再收 `vk=` 這個關鍵字。
         self._fallback_spec = hotkey.spec_from_vk(key_vk, require_e0)
         self._fallback_binding = hotkey.HotkeyBindings([self._fallback_spec])
-        # 目前按住的修飾鍵（自己維護 —— Raw Input 只給單一事件，
-        # 不給「現在 Ctrl 有沒有按住」）
-        self._mods_down: set[str] = set()
-        # 觸發狀態機（hold / toggle / double，**每一組按鍵各自**）
-        self._capturing = False
-        # 「等待第二下」的時間戳，**以規格為 key**（每組雙擊鍵各自獨立）
-        self._tap_at: dict = {}
-        # 目前按下的主鍵（VK 集合）—— 用來吃掉作業系統的**自動重複**。
-        # ⚠️ 沒有這一層的話：按住一顆 double 鍵不放，OS 每 ~30ms 送一次
-        # keydown，會被當成連續點擊 → 反而觸發錄音。
-        self._main_down: set[int] = set()
-        self._double_window = 0.4           # 秒；double 模式的兩下間隔上限
+        # 主鍵現在是不是按著（**跨「開始錄音 → 放開」兩個時間點**都要看得到，
+        # 因為自動重錄是在「放開的瞬間」才決定的，見 `_retry_empty_capture`）。
+        #
+        # ⚠️ 這一個**刻意留在 daemon**（不像其他狀態轉發給引擎）：它與音訊
+        #    重試邏輯綁在一起，而且 `_finish_recording()` 會在讀完它之後才清掉。
+        self._key_held = False
         self.traditional = traditional
         self.remove_period = remove_period
         self.mode = mode
@@ -142,6 +141,25 @@ class PttDaemon:
         # 傳 None 就用固定的 device_index（純終端機模式）。
         self.device_provider = device_provider
         self.cfg_provider = cfg_provider
+        # ------------------------------------------------ 觸發狀態機
+        #
+        # 觸發邏輯抽到 `app/core/trigger.py`（**平台無關**，mac 共用同一顆）。
+        # ⚠️ 這裡**不再**自己維護 `_mods_down` / `_tap_at` / `_main_down` /
+        #    `_capturing` / `_double_window` / `_test_until` —— 它們全是引擎的
+        #    狀態，daemon 只透過下面的 property 轉發（那些 property 是為了
+        #    相容既有呼叫端與測試而存在的）。
+        #    兩邊各留一份的症狀：一邊更新、一邊沒更新，而且通常只在某個平台
+        #    的某個模式下才看得出來。
+        #
+        # ⚠️ 一定要放在 `self.traditional` 等屬性指派**之後** ——
+        #    `_live()` 會讀它們，順序反了會 `AttributeError`（實測踩到）。
+        self.trigger = trigger.TriggerEngine(
+            get_bindings=self._bindings,
+            on_start=self._on_trigger_start,
+            on_finish=self._on_trigger_finish,
+            double_window=self._live()["double_tap_ms"] / 1000.0,
+            debug=debug,
+        )
         # 設定檔路徑 + 上次看到的 mtime：用來偵測「使用者手改檔案」並即時套用
         self.config_path = config_path
         self.config_loader = config_loader    # 由呼叫端注入，避免 ptt 直接依賴 config 模組
@@ -179,25 +197,11 @@ class PttDaemon:
         self._mic_device: int | None = None   # 目前串流開在哪個裝置（UI 顯示用）
         self._idle_at: float | None = None   # 上次放開的時間（idle_timeout 用）
         self._rec_started = 0.0
-        self._pressed = False
-        # 主鍵現在是不是按著（**跨「開始錄音 → 放開」兩個時間點**都要看得到，
-        # 因為自動重錄是在「放開的瞬間」才決定的，見 _retry_empty_capture）
-        self._key_held = False
         # ⚠️ 命名有點反直覺，但這是最不容易搞錯的寫法：
         #   `_retry_armed`＝這一次錄音**還沒**用掉自動重錄的機會
         #   `_retrying`  ＝這一次錄音**正在**自動重錄中（第二次之後不再重試）
         self._retry_armed = False
         self._retrying = False
-        # 結束鍵的狀態（見 _handle_key）：
-        #   `_end_armed`  ＝結束鍵按下了（行為是「鬆開才停」）→ keyup 收尾
-        #   `_end_pressed`＝結束鍵剛觸發過（其他行為，已經在 down 收尾）
-        # 兩者都是為了讓 **keyup 不會重複收尾**（放開不該再停一次）。
-        self._end_armed = False
-        self._end_pressed = False
-        # 「測試這個組合」模式（見 start_key_test）：時間戳 + 收到的按鍵
-        self._test_until = 0.0
-        self._test_which = ""
-        self._test_hits: list[dict] = []
         self._lock = threading.Lock()
         self._wndproc_ref = None
         self._hwnd = None
@@ -206,6 +210,78 @@ class PttDaemon:
         self._msg_count = 0
         self._input_count = 0
         self._last_unknown_dev: dict[int, dict] = {}
+
+    # ------------------------------------------------ 觸發狀態（轉發給引擎）
+    #
+    # ⚠️ 這些 property **只為相容既有呼叫端與測試**存在
+    #    （`tests/test_trigger.py`、`tests/test_mic_stream.py`、
+    #    `tools/p1/measure_ptt_modes.py` 直接讀 `_capturing`／`_mods_down`／
+    #    `_tap_at`／`_main_down`／`_double_window`）。
+    #    值一律來自 `self.trigger`，**不要在 daemon 再存一份** ——
+    #    兩份的症狀是「一邊更新、一邊沒更新」。
+    @property
+    def _capturing(self) -> bool:
+        return self.trigger.capturing
+
+    @_capturing.setter
+    def _capturing(self, value: bool) -> None:
+        self.trigger.capturing = bool(value)
+
+    @property
+    def _mods_down(self) -> set[str]:
+        return self.trigger.mods_down
+
+    @_mods_down.setter
+    def _mods_down(self, value) -> None:
+        self.trigger.mods_down = set(value)
+
+    @property
+    def _tap_at(self) -> dict:
+        return self.trigger.tap_at
+
+    @_tap_at.setter
+    def _tap_at(self, value: dict) -> None:
+        self.trigger.tap_at = dict(value)
+
+    @property
+    def _double_window(self) -> float:
+        return self.trigger.double_window
+
+    @_double_window.setter
+    def _double_window(self, value: float) -> None:
+        self.trigger.double_window = float(value)
+
+    @property
+    def _main_down(self) -> set:
+        return self.trigger.main_down
+
+    @property
+    def _pressed(self) -> bool:
+        """使用者此刻是不是按著（引擎的 `pressed`）。
+
+        ⚠️ `_finish_recording()` 會讀它來決定要不要自動重錄 ——
+        「放開之後才重錄」會錄到環境音，所以這個值必須是**放開的那一刻**的。
+        """
+        return self.trigger.pressed
+
+    @_pressed.setter
+    def _pressed(self, value: bool) -> None:
+        self.trigger.pressed = bool(value)
+
+    @property
+    def _test_until(self) -> float:
+        """測試模式的截止時間（引擎的狀態）。
+
+        ⚠️ **這個 property 是必要的，不是裝飾**：少了它，`d._test_until = …`
+        會**靜默地在 daemon 上建立一個新屬性**，而引擎看的是自己那一份 ——
+        症狀是「測試模式永遠不結束」或「設了時間卻沒有效果」，而且完全不會
+        報錯（實測踩到：`tests/test_trigger.py` `[19]` 直接指派它就中）。
+        """
+        return self.trigger._test_until            # noqa: SLF001
+
+    @_test_until.setter
+    def _test_until(self, value: float) -> None:
+        self.trigger._test_until = float(value)    # noqa: SLF001
 
     # ------------------------------------------------ 裝置判定
     def current_device(self) -> int:
@@ -936,292 +1012,103 @@ class PttDaemon:
         """這一組的觸發方式（預設按住說話）。"""
         return self._bindings().mode_of(spec)
 
-    def _end_owner(self, vk: int, e0: bool):
-        """這顆鍵是不是某一組的**結束鍵**？回傳那一組的開始規格。
+    # ------------------------------------------------ 引擎的兩個回呼
+    #
+    # 引擎只要求「開始」與「停止」兩個動作，其餘（什麼時候該開始／該停）
+    # 全在 `app/core/trigger.py`。錄音、ASR、注入留在這裡。
 
-        配對語法：`F9,Esc` ＝ 開始 F9、結束 Esc（見 `hotkey.parse_binding`）。
-        ⚠️ 只看**啟用中**的組合（停用的不該有反應）。
+    def _on_trigger_start(self, label: str) -> None:
+        """引擎說「開始」→ 這裡只負責錄音。
+
+        ⚠️ `stats["presses"]` 在這裡加一（原本在 `_on_main_down`／
+        `_toggle_capture` 的「開始」分支）—— 語意相同：**只有真的開始錄音**
+        才計數，被裝置政策擋掉或只是放開都不算。
+
+        ⚠️ 自動重錄的機會也在這裡重新武裝 —— 原本每個「開始」分支都寫了
+        `_retry_armed = True; _retrying = False`，抽到引擎之後「開始」只剩
+        這一個入口，所以只要寫一次（而且不可能漏掉某一條路徑）。
         """
-        b = self._bindings()
-        for spec in b.active:
-            end = b.end_of(spec)
-            if end is None:
-                continue
-            if self._spec_matches(end, vk, e0) and self._mods_ok(end, vk):
-                return spec
-        return None
+        self._retry_armed = True            # 新的錄音開始 → 重新武裝自動重錄
+        self._retrying = False
+        self.stats["presses"] += 1
+        self._start_recording(label)
 
-    # ------------------------------------------------ 測試這個組合
+    def _on_trigger_finish(self, pressed: bool) -> None:
+        """引擎說「停止」→ 這裡只負責收尾。
+
+        ⚠️ `_key_held` 必須在這裡、**在 `_finish_recording()` 之前**寫入 ——
+        `_finish_recording()` 會讀它來決定要不要自動重錄（見
+        `_retry_empty_capture`）。`pressed=False` 代表「明確被結束鍵收尾」或
+        「toggle/double 的第二次按下」，那兩種情況都不該重錄（會錄到環境音）。
+        """
+        self._key_held = bool(pressed)
+        self._finish_recording()
+
+    # ------------------------------------------------ 轉發給引擎（相容既有呼叫端）
+    def _end_owner(self, key, e0: bool = False):
+        """這顆鍵是不是某一組的**結束鍵**？回傳那一組的開始規格。"""
+        return self.trigger.end_owner(key, e0)
+
     def start_key_test(self, seconds: float = 20.0, which: str = "") -> dict:
         """開始「測試」：聽按鍵，但**不錄音、不注入**，只回報收到什麼。
 
-        為什麼要做（實測回饋：「除了沒有測試之外其他基本上都像是我想要的」）：
         設定好一顆鍵之後，使用者唯一的驗證方式是「按下去看有沒有反應」——
-        但那會真的開始錄音、注入文字到他正在打的地方。
-        所以需要一個**只聽不做**的模式：按下去，畫面回報
-        「✓ 收到 F9，會開始錄音」，不會有任何副作用。
-
-        `which`＝只測這一組的開始鍵（空字串＝測全部）。
+        但那會真的開始錄音、注入文字到正在打的地方。所以需要一個
+        **只聽不做**的模式（實作在 `app/core/trigger.py`）。
         """
-        self._test_until = time.monotonic() + max(3.0, float(seconds))
-        self._test_which = which
-        self._test_hits = []
-        if self.debug or True:
-            print(f"  🧪 測試模式：請按你要測的按鍵（{seconds:.0f} 秒內有效；"
-                  f"不會錄音）", flush=True)
-        return {"ok": True, "seconds": seconds, "which": which}
+        return self.trigger.start_key_test(seconds, which)
 
     def cancel_key_test(self) -> None:
-        self._test_until = 0.0
-        self._test_hits = []
-        self._test_which = ""
-
-    def _note_test_hit(self, vk: int, e0: bool, hits: list, down: bool) -> None:
-        """測試模式下收到一個事件 → 記下來（給 UI 顯示）。"""
-        if not down or time.monotonic() > self._test_until:
-            return
-        b = self._bindings()
-        # 這顆鍵的「角色」：開始鍵？結束鍵？還是不相關？
-        roles: list[str] = []
-        for spec in b.active:
-            if self._spec_matches(spec, vk, e0) and self._mods_ok(spec, vk):
-                roles.append(f"開始鍵（{b.label_of(spec)}）")
-            end = b.end_of(spec)
-            if end is not None and self._spec_matches(end, vk, e0) \
-                    and self._mods_ok(end, vk):
-                roles.append(f"結束鍵（{b.label_of(spec)}）")
-        if not hits and not roles:
-            # 沒命中的鍵也報出來 —— 「按了沒反應」時最需要知道的就是
-            # 「有沒有收到」，而不是只有「沒有」。
-            roles = ["不相關的鍵（不會觸發）"]
-        self._test_hits.append({
-            "vk": vk, "e0": e0, "down": down,
-            "mods": sorted(self._mods_down),
-            "roles": roles,
-            "at": time.strftime("%H:%M:%S"),
-        })
-        if self.debug:
-            print(f"  🧪 測試收到 vk=0x{vk:02X} e0={e0} → {roles}", flush=True)
+        self.trigger.cancel_key_test()
 
     def test_state(self) -> dict:
         """測試模式的狀態（給 UI 輪詢）。"""
-        now = time.monotonic()
-        running = bool(self._test_until) and now < self._test_until
-        if self._test_until and not running:
-            self._test_until = 0.0            # 逾時自動結束
-        return {
-            "running": running,
-            "remaining": round(max(0.0, self._test_until - now), 1) if running else 0.0,
-            "which": self._test_which,
-            "hits": list(self._test_hits)[-5:],
-        }
-
-    def _finish_explicit(self) -> None:
-        """由**明確的結束鍵**收尾（不是靠開始行為，也不是靠放開開始鍵）。"""
-        self._capturing = False
-        self._pressed = False
-        self._key_held = False          # 使用者不是靠放開結束的 → 不自動重錄
-        self._end_armed = False
-        self._end_pressed = False
-        self._finish_recording()
-
-    def _spec_matches(self, spec, vk: int, e0: bool) -> bool:
-        """這顆鍵是不是這一組的主鍵？
-
-        詳細的 VK 家族對應與左右側判定都在 `hotkey.spec_hit()`
-        （單一真相來源 —— 這裡不再自己實作一份）。
-        """
-        return hotkey.spec_hit(spec, vk, e0)
-
-    def _mods_ok(self, spec, main_vk: int | None = None) -> bool:
-        """這一組的修飾鍵是否都按住了（不多也不少）。
-
-        `main_vk` 用來處理「主鍵本身就是修飾鍵」的情況（例如單獨一顆
-        RightCtrl 當錄音鍵）—— 那時它會出現在 `_mods_down` 裡，
-        但它不是「需要另外按住的修飾鍵」，所以要排除掉再比對。
-        """
-        return hotkey.mods_ok(spec, self._mods_down)
-
-    def _toggle_capture(self, label: str) -> None:
-        """toggle / double 模式的「開始 ↔ 停止」。
-
-        ⚠️ 停止時要把 `_key_held` 清掉：這兩種模式的錄音是「按一下開始」，
-        使用者早就放開了，若留著 True，之後的自動重錄會以為他還按著，
-        變成對著空氣重錄一段（而且錄到的是環境音）。
-        """
-        if self._capturing or self._cap is not None:
-            self._capturing = False
-            self._pressed = False
-            self._key_held = False
-            self._finish_recording()
-        else:
-            self._capturing = True
-            self.stats["presses"] += 1
-            self._start_recording(label)
-
-    def _on_main_down(self, spec, label: str) -> None:
-        """主鍵按下。**依這一組自己的觸發方式**決定要做什麼。
-
-        ⚠️ 為什麼模式是「每一組」而不是全域：實測回饋「無法錄製雙擊」——
-        真實情境是「藍牙麥克風按住說話 ＋ 鍵盤 F9 雙擊」。
-        全域一個模式做不到，而兩組各自的狀態也必須分開記
-        （`_tap_at` 用規格當 key，見 `tick_trigger`）。
-        """
-        mode = self._mode_of(spec)
-        if mode == hotkey.MODE_TOGGLE:
-            self._toggle_capture(label)
-            return
-        if mode == hotkey.MODE_DOUBLE:
-            # 單擊不動作，等第二下（模仿 macOS 的聽寫手勢）
-            now = time.monotonic()
-            last = self._tap_at.get(spec, 0.0)
-            if last and (now - last) <= self._double_window:
-                self._tap_at[spec] = 0.0        # 用掉這次配對
-                self._retry_armed = True        # 新的錄音開始 → 重新武裝自動重錄
-                self._retrying = False
-                self._toggle_capture(label)
-            else:
-                self._tap_at[spec] = now
-            return
-        # hold（預設）：按住就開始
-        if not self._capturing:
-            self._capturing = True
-            self._retry_armed = True            # 新的錄音開始 → 重新武裝自動重錄
-            self._retrying = False
-            self.stats["presses"] += 1
-            self._start_recording(label)
-
-    def _on_main_up(self, spec) -> None:
-        """主鍵放開。
-
-        ⚠️ **只有 `hold` 模式該在這裡動作。** toggle / double 是「按下才算
-        一次」，若放開也處理，按一下就會「開始＋馬上停」——
-        實測被測試抓到（第一下按完 `_capturing` 又變回 False）。
-
-        ⚠️ **而且設定了結束鍵時也不能在放開時停**：`F9,Escape` 的意思是
-        「按 F9 開始、按 Escape 結束」，F9 放開只代表「開始鍵按完了」。
-        這條規則讓「用同一顆鍵的組合鍵當開始鍵」也說得通
-        （`Ctrl+Alt+R` 放開 R 不該結束錄音）。
-        """
-        b = self._bindings()
-        if b.end_of(spec) is not None:
-            return                      # 收尾交給結束鍵
-        if self._mode_of(spec) == hotkey.MODE_HOLD and self._capturing:
-            self._capturing = False
-            self._finish_recording()
+        return self.trigger.test_state()
 
     def tick_trigger(self) -> None:
-        """double 模式的計時器：超過配對視窗就清掉「等待第二下」的狀態。
+        """double 模式的計時器（主迴圈定期呼叫）。
 
-        ⚠️ 必須由主迴圈定期呼叫。沒有它，double 模式會永遠配不到第二下。
-        ⚠️ 待配對的狀態是**每一組各記一份**（`_tap_at`）。用單一變數的話，
-        在兩顆雙擊鍵之間輪流按就會互相蓋掉（A 一下、B 一下 → B 變成雙擊）。
+        ⚠️ 沒有它，double 模式永遠配不到第二下。
         """
-        now = time.monotonic()
-        for spec, at in list(self._tap_at.items()):
-            if at and (now - at) > self._double_window:
-                self._tap_at[spec] = 0.0
+        self.trigger.tick()
 
     def _handle_key(self, hdevice, kb: RAWKEYBOARD) -> None:
+        """Raw Input 事件 → 平台無關的 `trigger.Event`。
+
+        ⚠️ 這一層**只做轉譯**，不做任何觸發判斷 —— 判斷都在
+        `app/core/trigger.py`（兩個平台共用同一顆）。留在這裡的只有
+        Windows 專屬的資訊：`E0` 旗標與來源裝置。
+        """
         vk = int(kb.VKey)
         e0 = bool(int(kb.Flags) & RI_KEY_E0)
         down = kb.Message in (WM_KEYDOWN, WM_SYSKEYDOWN)
-
-        # 修飾鍵狀態要**先**更新 —— 主鍵的判定會用到它。
-        # Raw Input 只送單一事件，不告訴我們「現在 Ctrl 有沒有按住」。
-        mod_name = hotkey.MODIFIER_VKS.get(vk)
-        if mod_name:
-            if down:
-                self._mods_down.add(mod_name)
-            else:
-                self._mods_down.discard(mod_name)
-
-        # 多組錄音鍵：只要有**任何一組**（啟用中的）主鍵與修飾鍵條件成立就觸發。
-        # 標籤取第一組命中的，只為了讓除錯輸出說得出「是哪一組」。
-        hits = [s for s in self._bindings().active
-                if self._spec_matches(s, vk, e0) and self._mods_ok(s, vk)]
-
-        # 「測試這個組合」模式：只回報「有沒有收到」，**絕不錄音**
-        # （見 `start_key_test`）。放在最前面，因為測試時不該有任何副作用。
-        # ⚠️ 時間判斷要在這裡做（不能只看 `_test_until` 有沒有值）——
-        # 過期後那個時間戳還留著，只判斷「有值」會讓錄音功能**永遠失效**。
-        if self._test_until and time.monotonic() < self._test_until:
-            self._note_test_hit(vk, e0, hits, down)
-            if self._test_hits:
-                return
-
-        # ⚠️ **結束鍵優先於行為**（實測回饋：「也可以接受按鍵不一樣做
-        # 開始和結束的配對」）。使用者在設定裡明確寫了結束鍵（`F9,Esc`）時，
-        # 就以那顆鍵為準 —— 這時「開始行為」只是開始的方式，不再決定怎麼收尾。
-        # 結束鍵自己有行為（`F9,Esc@hold`＝**鬆開**才停、`@toggle`＝再按一下停）。
-        if not hits and self._capturing:
-            owner = self._end_owner(vk, e0)
-            if owner is not None:
-                end_mode = self._bindings().end_mode_of(owner)
-                # down 才動作（toggle / double 的判斷也走同一條路）
-                if down:
-                    if end_mode == hotkey.MODE_HOLD:
-                        # 「鬆開才停」→ 先記下來，等 keyup 再收尾
-                        self._end_armed = True
-                        if self.debug:
-                            print(f"  · 結束鍵按下（{self._bindings().label_of(owner)}）"
-                                  f"→ 等鬆開才停")
-                    else:
-                        self._end_pressed = True
-                        if self.debug:
-                            print(f"  · 結束鍵 {self._bindings().label_of(owner)} → 停止錄音")
-                        with self._lock:
-                            self._finish_explicit()
-                elif self._end_armed or self._end_pressed:
-                    self._end_armed = False
-                    self._end_pressed = False
-                    if self.debug:
-                        print(f"  · 結束鍵鬆開 → 停止錄音")
-                    with self._lock:
-                        self._finish_explicit()
-                return
-
-        if not hits:
-            self._main_down.discard(vk)     # 沒命中的鍵不該留在按下集合裡
-            return
-        spec = hits[0]
-        target, label = self._is_target_device(hdevice)
-
-        # 被拒絕的時候要說得出原因，否則只能看到「按了沒反應」。
-        # 實測踩過：送合成的 Ctrl 進來時 make=0、裝置無名、沒有 E0，
-        # 結果整個事件被靜默丟棄，完全查不出為什麼。
-        #
-        # ⚠️ 修飾鍵不符原本也在這裡回報，現在改由上面的 `hits` 一起判斷
-        # （多組的情況下「修飾鍵不符」不再是單一原因，而是「沒有一組成立」）。
-        # 裝置篩選只在「用裝置原生鍵」時才有意義。使用者若刻意把錄音鍵
-        # 改成別的鍵（完全脫離硬體），就不該再要求裝置符合 filter。
-        if not target and self.device_filter and not self._allow_any_device():
+        name, by_name = hotkey._vk_to_name_side(vk)
+        if not name:
+            # 認不得的 VK：**不猜**（專案規則 2）。說出來，不要靜默丟掉，
+            # 否則症狀是「按了沒反應」而完全查不出原因。
             if self.debug:
-                print(f"  · 忽略 {label} 的 {spec.label}（不是目標裝置）")
+                print(f"  · 忽略未知的虛擬鍵碼 0x{vk:02X}")
             return
 
-        # 作業系統的自動重複（按住不放時每 ~30ms 一次 keydown）要吃掉。
-        # ⚠️ 這對 double 模式是**必要**的：重複事件會落在配對視窗內，
-        # 被誤認為「按了兩下」，於是按住不放反而開始錄音。
-        if down:
-            if vk in self._main_down:
-                if self.debug:
-                    print(f"  · 忽略自動重複 {spec.label}")
-                return
-            self._main_down.add(vk)
-        else:
-            self._main_down.discard(vk)
+        # ⚠️ 自動重複的判斷用 **canonical token**，不能用 VK：
+        #    同一個事件可能是通用 VK（0x11 + E0）也可能是專用 VK（0xA3），
+        #    兩者 VK 不同但是**同一顆鍵** —— 用 VK 當 key 會讓「按住右 Ctrl
+        #    不放」的自動重複漏掉一半，double 模式就會被誤判成連點。
+        token = trigger.token_of(name, e0, by_name)
 
-        if self.debug:
-            print(f"  · 接受 {spec.label}（{self._mode_of(spec)}）"
-                  f"{'DOWN' if down else 'UP  '} "
-                  f"flags=0x{int(kb.Flags):X} dev={label} capturing={self._capturing}")
+        # 裝置政策只在「用裝置原生鍵」時才有意義。使用者若刻意把錄音鍵
+        # 改成別的鍵（完全脫離硬體），就不該再要求裝置符合 filter。
+        target, label = self._is_target_device(hdevice)
+        device_ok = bool(target or not self.device_filter or self._allow_any_device())
 
         with self._lock:
-            if down:
-                self._on_main_down(spec, label)
-            else:
-                self._on_main_up(spec)
+            self.trigger.feed(trigger.Event(
+                key=name, down=down, e0=e0,
+                mods=frozenset(self.trigger.mods_down),
+                device=label,
+                device_ok=device_ok,
+                autorepeat=(down and token in self.trigger.main_down),
+            ))
 
     def _allow_any_device(self) -> bool:
         """按鍵設定是否允許來自任何裝置。
@@ -1230,9 +1117,9 @@ class PttDaemon:
         別的來源（鍵盤、滑鼠側鍵…）。這種情況不該再要求裝置符合
         `device_filter` —— 否則「完全脫離硬體」做不到。
 
-        裝置原生鍵的定義：VK_CONTROL + 限定右側 + 沒有其他修飾鍵。
+        裝置原生鍵的定義：Ctrl + 限定右側 + 沒有其他修飾鍵。
         """
-        return self._bindings().accepts_any_device
+        return self.trigger.allow_any_device()
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         self._msg_count += 1

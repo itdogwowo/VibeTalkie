@@ -604,7 +604,13 @@ def test_auto_retry_first_empty() -> None:
     d3._start_recording = lambda label: orig_start3(label)
     d3._finish_recording = lambda: (orig_finish3(), d3._set_state("IDLE"))[1]
     press(d3, VK["RCtrl"], True, e0=True)
-    d3._key_held = False                      # 模擬「放開時才知道沒收到音訊」
+    # ⚠️ 模擬「放開的那一刻已經知道收不到音訊」。
+    #    這裡要清的是**引擎**的 pressed（`_key_held` 是它的衍生值：
+    #    `press(down)` 會設下 `pressed=True`，而 `_on_trigger_finish()`
+    #    在呼叫 `_finish_recording()` 之前會用 `pressed` 覆蓋 `_key_held` ——
+    #    所以只改 `_key_held` 沒有用，會在收尾時被蓋回去）。
+    #    實際情境：使用者按著講完、放開 → 引擎在 keyup 時就知道他放開了。
+    d3.trigger.pressed = False
     press(d3, VK["RCtrl"], False, e0=True)
     check("使用者已放開 → 不重錄", len(caps3) == 1, str(len(caps3)))
 
