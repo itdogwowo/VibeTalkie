@@ -22,6 +22,10 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 import model_index as mi  # noqa: E402
 
 failures: list[str] = []
@@ -131,17 +135,6 @@ def live_stats() -> int:
 
 
 def main() -> int:
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    except Exception:
-        pass
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
     if "--live" in sys.argv:
         return live_stats()
 

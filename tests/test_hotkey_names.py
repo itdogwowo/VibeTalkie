@@ -34,6 +34,10 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 import hotkey as hk  # noqa: E402
 
 failures: list[str] = []
@@ -46,17 +50,6 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> int:
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    except Exception:                                  # noqa: BLE001
-        pass
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:                              # noqa: BLE001
-            pass
-
     print("=" * 68)
     print("hotkey canonical 名稱契約")
     print("=" * 68)

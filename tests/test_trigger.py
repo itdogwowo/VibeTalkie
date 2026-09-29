@@ -45,6 +45,10 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 import hotkey as hotkey_mod  # noqa: E402
 import ptt as ptt_mod  # noqa: E402
 

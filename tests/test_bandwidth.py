@@ -25,7 +25,11 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
-from record_wav import estimate_bandwidth, setup_console  # noqa: E402
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
+from record_wav import estimate_bandwidth  # noqa: E402
 
 try:
     import numpy as np
@@ -87,7 +91,6 @@ CASES = [
 
 
 def main() -> int:
-    setup_console()
     failures = 0
     print(f"{'案例':<34} {'位準 dBFS':>10} {'delta dB':>9}  判定")
     print("-" * 78)

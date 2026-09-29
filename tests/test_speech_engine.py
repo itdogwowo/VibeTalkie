@@ -25,6 +25,10 @@ sys.path.insert(0, str(HERE.parent / "app"))
 sys.path.insert(0, str(HERE.parent / "app" / "core"))
 sys.path.insert(0, str(HERE.parent / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 from speech_engine import (  # noqa: E402
     ApiEngine,
     EngineNotConfigured,
@@ -215,17 +219,6 @@ def test_paraformer_kwarg() -> None:
 
 
 def main() -> int:
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    except Exception:
-        pass
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
     print("=" * 70)
     print("speech_engine 單元測試")
     print("=" * 70)

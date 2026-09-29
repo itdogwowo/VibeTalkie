@@ -43,6 +43,10 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 # 測試用的已知音檔（粵語 TTS）。找不到就跳過，不要假裝通過。
 CANDIDATE_WAVS = [
     Path("/tmp/vt-eval/audio/c1.wav"),

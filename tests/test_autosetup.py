@@ -34,6 +34,10 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 # ⚠️ 用**正常的 import**，不要用 spec_from_file_location。
 #
 # 實際踩到：測試用 spec_from_file_location 載入 autosetup，會建立一個

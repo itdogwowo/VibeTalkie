@@ -30,6 +30,10 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 import models  # noqa: E402
 from config import Config  # noqa: E402
 from models import ModelManager  # noqa: E402
@@ -52,17 +56,6 @@ def free_port() -> int:
 
 
 def main() -> int:
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    except Exception:
-        pass
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
     cfg = Config.load()
     ready = models.installed_models()
     if not ready:

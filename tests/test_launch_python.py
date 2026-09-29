@@ -44,6 +44,10 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 # launch.py 在 repo 根目錄（不在 app/），所以不能用一般 import
 _spec = importlib.util.spec_from_file_location("vt_launch", ROOT / "launch.py")
 assert _spec and _spec.loader, "找不到 launch.py"

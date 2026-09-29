@@ -31,6 +31,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 spec = importlib.util.spec_from_file_location(
     "fw", ROOT / "tools" / "p1" / "fetch_wheels.py")
 fw = importlib.util.module_from_spec(spec)
