@@ -39,6 +39,10 @@ sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
 
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
+
 failures: list[str] = []
 
 
@@ -114,7 +118,8 @@ def main() -> int:
     # ⚠️ `config.py` 住在 `app/`（不是 `app/core/`）—— 這份清單要照實際的
     #    目錄結構寫，不要照「想像中的結構」。寫錯的症狀是「測試說檔案不存在」，
     #    而檔案明明在（實際踩到）。
-    for rel in ("app/core/trigger.py", "app/core/hotkey.py", "app/config.py"):
+    for rel in ("app/core/trigger.py", "app/core/hotkey.py", "app/core/launch_guard.py",
+                "app/config.py"):
         path = ROOT / rel
         if not path.exists():
             check(f"{rel} 存在", False, "檔案不存在")

@@ -30,6 +30,12 @@
 （`tests/test_config_api.py` 開頭記錄過這個坑：測試存檔存到真的設定檔，
 把使用者的 `device_index` 與 `mic_name` 一起重設掉。）
 
+## ⚠️ 這支測試驗「行為」，不驗「有沒有兩份」
+
+規則本身住在共用層 `app/core/launch_guard.py`（原本 `vibetalkie.py` 與
+`ui_server.py` 各有一份 —— 那就是漂移）。「這條規則只能有一份實作」
+由 `tests/test_shared_layer.py` 用 AST 釘住，兩支一起看才完整。
+
 執行：python tests/test_launch_guard.py
 """
 
@@ -48,6 +54,10 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT / "app"))
 sys.path.insert(0, str(ROOT / "app" / "core"))
 sys.path.insert(0, str(ROOT / "third_party"))
+
+import _console  # noqa: E402  # 測試輸出一律 UTF-8（Windows 管線下預設是 cp950）
+
+_console.setup()
 
 failures: list[str] = []
 
@@ -138,23 +148,23 @@ def main() -> int:
 
 
 def _run() -> int:
-    print("\n[1] pick_port() 的行為（純邏輯）")
-    import vibetalkie as vt
+    print("\n[1] pick_port() 的行為（純邏輯，規則住在共用層 app/core/launch_guard.py）")
+    import launch_guard as guard
 
     p = free_port()
-    check("沒人用的 port 直接回傳它", vt.pick_port(p) == p, str(p))
+    check("沒人用的 port 直接回傳它", guard.pick_port(p) == p, str(p))
 
     holder = bind(p)
     try:
-        check("port_in_use() 認得出被佔用", vt.port_in_use(p) is True, str(p))
+        check("port_in_use() 認得出被佔用", guard.port_in_use(p) is True, str(p))
         try:
-            got = vt.pick_port(p)
+            got = guard.pick_port(p)
             check("被佔用就丟 AlreadyRunning（**不要靜默讓位**）", False,
                   f"竟然回傳了 {got}（真實情境就是這樣漂到隔壁的）")
-        except vt.AlreadyRunning as exc:
+        except guard.AlreadyRunning as exc:
             check("被佔用就丟 AlreadyRunning（**不要靜默讓位**）", True, str(exc))
         # span > 1 是給「確定要讓位」的場合（目前沒有這種呼叫端）
-        nxt = vt.pick_port(p, span=2)
+        nxt = guard.pick_port(p, span=2)
         check("明確要求 span>1 時才讓位", nxt == p + 1, str(nxt))
     finally:
         holder.close()
@@ -208,9 +218,9 @@ def _run() -> int:
     holders = occupy_range(p_pool, 3)
     try:
         try:
-            got = vt.pick_port(p_pool, span=3)
+            got = guard.pick_port(p_pool, span=3)
             check("池滿了要丟 AlreadyRunning", False, f"竟然回傳了 {got}")
-        except vt.AlreadyRunning as exc:
+        except guard.AlreadyRunning as exc:
             check("池滿了要丟 AlreadyRunning", True, str(exc))
     finally:
         close_all(holders)
@@ -234,7 +244,7 @@ def _run() -> int:
     started = False
     deadline = time.time() + 30
     while time.time() < deadline:
-        if vt.port_in_use(p3):
+        if guard.port_in_use(p3):
             started = True
             break
         if proc.poll() is not None:

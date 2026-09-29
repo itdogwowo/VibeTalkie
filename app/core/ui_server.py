@@ -46,6 +46,8 @@ for _p in (ROOT / "app", ROOT / "app" / "core", ROOT / "third_party"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+import launch_guard  # noqa: E402  # 啟動防護（兩平台共用，見同目錄 launch_guard.py）
+
 
 class Status:
     """UI 要的狀態容器（平台無關）。
@@ -626,63 +628,6 @@ def _models_payload(cfg, force: bool = False) -> dict:
 # ---------------------------------------------------------------- 啟動
 
 
-class AlreadyRunning(Exception):
-    """已經有另一個 VibeTalkie 在用這些 port。
-
-    ## 為什麼要有這個例外（實測踩到，症狀是「設定一直被還原」）
-
-    原本 `pick_port()` 找不到可用的 port 就 raise `RuntimeError`，
-    而**兩個呼叫端都沒接** —— 所以症狀是「按了啟動，跳出一個看不懂的
-    traceback」，而不是「已經在執行了，請先關掉舊的」。
-
-    但更嚴重的是 Windows 版：它那裡找不到 port 會**直接回傳 preferred**，
-    也就是默默換一個 port 起來。兩個行程共用同一個 `config.toml`，
-    各自握一份記憶體，於是舊行程會把新設定蓋回去 ——
-    使用者的感受是「我存了，過一陣子又變回去」。
-
-    實測證據（同一台機器，兩個行程都活著）：
-
-        磁碟：model_dir = "sherpa-onnx-paraformer-…"、mic_stream = "session"
-        舊行程記憶體：model_dir = ""（空）、mic_stream = "per_press"
-
-    ⚠️ 這裡是**共用層**，所以兩個平台都要有一樣的訊息與行為。
-    """
-
-
-def port_in_use(port: int) -> bool:
-    """這個 port 有東西在 listen 嗎？（用綁定探測，不是 `connect_ex`）
-
-    ⚠️ `SO_REUSEADDR` 不要設 —— 設了會讓「已被佔用」的 port 也綁得上，
-    這個函式就永遠回 False。
-    """
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return False
-        except OSError:
-            return True
-
-
-def pick_port(preferred: int, span: int = 1) -> int:
-    """取得要用的 port。**被佔用就丟 `AlreadyRunning`，不自動漂流。**
-
-    ⚠️ `span` 預設是 1 是刻意的 —— 見 `AlreadyRunning` 的 docstring。
-    「從 preferred 起算 20 號裡找一個空的」那個設計會讓防護**完全失效**：
-    舊實例佔著 8756 時 8757 當然是空的，於是每次重複啟動都成功，
-    而兩個行程接著互相覆蓋 `config.toml`。
-
-    （Windows 版一開始就是這樣寫錯，而且測試因為只佔住一號而通過。
-    **測試要照真實情境設計，不是照實作設計。**）
-    """
-    for port in range(preferred, preferred + span):
-        if not port_in_use(port):
-            return port
-    raise AlreadyRunning(
-        f"port {preferred} 已被佔用"
-        + (f"（{preferred}–{preferred + span - 1} 都滿了）" if span > 1 else ""))
-
-
 def start_server(status: Status, port: int) -> ThreadingHTTPServer:
     """在背景執行緒啟動 UI 伺服器，回傳 server 物件。
 
@@ -724,13 +669,14 @@ if __name__ == "__main__":
     st.engine_name = getattr(cfg, "engine", "")
     st.model_wanted = getattr(cfg, "model_dir", "")
     try:
-        port = pick_port(args.port)
-    except AlreadyRunning as exc:
-        print("\n  ⚠️ 已經有另一個 VibeTalkie 在用這個 port。")
-        print(f"     {exc}")
-        print("\n  同時跑兩個會讓**設定互相覆蓋**（各自記一份，存檔時整個寫回），")
-        print("  症狀是「設定存了又變回去」。請先關掉舊的，或改用別的 port：")
-        print(f"    python app/core/ui_server.py --port {args.port + 100}")
+        port = launch_guard.pick_port(args.port)
+    except launch_guard.AlreadyRunning as exc:
+        for line in launch_guard.explain(
+                exc,
+                command="python app/core/ui_server.py",
+                close_hints=["舊的視窗按 Ctrl+C（macOS 是 ⌘Q 完全結束，不是只關視窗）"],
+                alt_port=args.port + 100):
+            print(line)
         raise SystemExit(1) from None
     start_server(st, port)
     url = f"http://127.0.0.1:{port}/"

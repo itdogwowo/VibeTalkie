@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import socket
 import sys
 import threading
 import time
@@ -42,6 +41,9 @@ from models import ModelManager  # noqa: E402
 from speech_engine import build_engine, has_opencc  # noqa: E402
 from ptt import PttDaemon  # noqa: E402
 from record_wav import list_devices, setup_console  # noqa: E402
+from launch_guard import AlreadyRunning, explain, pick_port  # noqa: E402
+# ↑ 啟動防護（同一個 port 已經有實例在跑就拒絕啟動）：規則與訊息都在共用層，
+#   見 app/core/launch_guard.py
 
 UI_DIR = HERE / "ui"
 VENDOR_PROCESS = "shandianshuo"
@@ -382,84 +384,6 @@ def check_bt_mic_warning(cfg: Config, devs: list[dict]) -> str | None:
     return ("你用的是藍牙麥克風。錄音期間，其他藍牙音訊裝置（例如耳機）"
             "會暫時完全中斷、放開後才恢復 —— 這是藍牙控制器的資源限制，"
             "不是程式問題。改用 USB 或有線麥克風可完全避免。")
-
-
-class AlreadyRunning(Exception):
-    """已經有另一個 VibeTalkie 在用這個 port。
-
-    ## 為什麼要有這個例外（實測踩到，症狀是「設定一直被還原」）
-
-    原本 `pick_port()` 找不到可用的 port 就**直接回傳 preferred** ——
-    使用者再啟動一次時，第二個行程會靜默地換一個 port 起來，
-    而他完全不會知道。
-
-    後果不只是「兩個視窗」：
-
-      · 兩個行程**共用同一個 `config.toml`**，各自握一份記憶體
-      · `cfg.save()` 有 5 處（啟動、換麥克風、換模型、UI 儲存…），
-        每次都是**整個檔案重寫**
-      · 於是舊行程會把它記憶體裡的舊值蓋回去 —— 使用者的感受是
-        「我存了，過一陣子又變回去」，而且檔案永遠看起來是對的
-
-    實測證據（同一台機器，兩個行程都活著）：
-
-        磁碟：model_dir = "sherpa-onnx-paraformer-…"、mic_stream = "session"
-        舊行程記憶體：model_dir = ""（空）、mic_stream = "per_press"
-
-    所以**寧可拒絕啟動，也不要默默開第二個**。
-    """
-
-
-def port_in_use(port: int) -> bool:
-    """這個 port 有東西在 listen 嗎？
-
-    ⚠️ 用**綁定探測**，不是 `connect_ex()`。兩者的差別是實際踩到的 bug：
-    `connect_ex` 問的是「連得上嗎」，所以對「已綁定但還沒開始 accept」
-    或防火牆丟 RST 的 port 會回「沒人用」→ 於是回傳一個根本用不到的 port。
-    綁定探測問的才是我們真正要問的問題：「我綁得上嗎？」
-
-    `SO_REUSEADDR` **不要設**：設了會讓「已被佔用」的 port 也綁得上，
-    那樣這個函式就永遠回 False（Windows 的行為與 Linux 不同，不可依賴）。
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return False
-        except OSError:
-            return True
-
-
-def pick_port(preferred: int, span: int = 1) -> int:
-    """取得要用的 port。**被佔用就丟 `AlreadyRunning`，不自動漂流。**
-
-    ## ⚠️ 為什麼 `span` 預設是 1（這是一個實測踩到的錯誤設計）
-
-    第一版寫成「從 `preferred` 起算 20 號裡找一個空的」，理由是「port 被
-    佔用時讓位比較方便」。那個設計讓防護**完全失效**：
-
-        port_in_use(8756) → True        # 偵測正確：舊實例在跑
-        pick_port(8756)   → 8757        # 但 8757 是空的 → 讓位 → 靜默啟動第二個
-
-    真實情境就是這樣：舊實例佔著 8756，8757 當然是空的。於是使用者
-    **每次重複啟動都會成功**，而且他完全不知道 —— 接著兩個行程開始
-    互相覆蓋 `config.toml`（見 `AlreadyRunning` 的 docstring）。
-    （測試之所以沒抓到，是因為它只佔住 8756 一號，而 `span=20` 的邏輯
-    向後讓位就通过了。**測試要照真實情境設計，不是照實作設計。**）
-
-    ## 想刻意跑第二個
-
-    明確指定 `--port` 就是「我要那個位置」：那個 port 被佔用時**也是**
-    `AlreadyRunning`（誠實報錯，而不是偷偷換一個）。
-
-    `span > 1` 只在**確定要讓位**的場合才傳（目前沒有這種呼叫端）——
-    例如未來做「自動挑一個空 port 的暫時實例」。
-    """
-    for p in range(preferred, preferred + span):
-        if not port_in_use(p):
-            return p
-    raise AlreadyRunning(
-        f"port {preferred} 已被佔用"
-        + (f"（{preferred}–{preferred + span - 1} 都滿了）" if span > 1 else ""))
 
 
 # ---------------------------------------------------------------- HTTP
@@ -820,15 +744,17 @@ def main(argv: list[str] | None = None) -> int:
     except AlreadyRunning as exc:
         # ⚠️ 訊息要**具體可行**，不能只說「失敗」——
         #    使用者看到的是「我明明按了啟動」，他需要知道去哪裡關掉舊的。
-        print("\n  ⚠️ VibeTalkie 好像已經在執行了。")
-        print(f"     {exc}")
-        print("\n  同時跑兩個會讓**設定互相覆蓋**（各自記一份，存檔時整個寫回），")
-        print("  症狀是「設定存了又變回去、模型自己換掉」。所以這裡刻意拒絕啟動。")
-        print("\n  請先關掉舊的那一個：")
-        print("    · 舊的 VibeTalkie 視窗（那個黑色命令提示字元視窗）按 Ctrl+C")
-        print("    · 或在工作管理員結束 Python 行程")
-        print("\n  想刻意同時跑兩個（例如測試）請指定不同 port：")
-        print(f"    python app/vibetalkie.py --port {cfg.port + 100}")
+        #    文字在共用層（`launch_guard.explain`），這裡只給**平台專屬的
+        #    「怎麼關掉舊的」** —— 三份訊息唯一的差別就是那一句。
+        for line in explain(
+                exc,
+                command="python app/vibetalkie.py",
+                close_hints=[
+                    "舊的 VibeTalkie 視窗（那個黑色命令提示字元視窗）按 Ctrl+C",
+                    "或在工作管理員結束 Python 行程",
+                ],
+                alt_port=cfg.port + 100):
+            print(line)
         return 1
 
     print("=" * 62)

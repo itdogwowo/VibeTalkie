@@ -165,6 +165,7 @@ except ImportError as _exc:                 # pyobjc 還沒裝
 
 # UI 伺服器（純標準函式庫，不需要 pyobjc）—— 服務 app/ui/ 的設定頁面
 import ui_server                        # noqa: E402
+import launch_guard                     # noqa: E402（啟動防護，兩平台共用）
 
 MIN_AUDIO_S = 0.2          # 短於這個視為誤觸（與 architecture.md §2 一致）
 MAX_RECORD_S = 120.0
@@ -599,23 +600,28 @@ class MacPttDaemon:
             #    因為 app.js 的判斷是 `mic_device != null`，空字串會通過。
             self.ui.mic_device = _mic_label()
             try:
-                port = ui_server.pick_port(ui_port)
+                port = launch_guard.pick_port(ui_port)
                 ui_server.start_server(self.ui, port)
                 url = f"http://127.0.0.1:{port}/"
                 print(f"\n  🖥  設定頁面：{url}")
                 print("     （錄音鍵、觸發方式、模型、輸出模式都在那裡改）")
                 if open_browser:
                     ui_server.open_browser(url)
-            except ui_server.AlreadyRunning as exc:
+            except launch_guard.AlreadyRunning as exc:
                 # ⚠️ 這一條要單獨處理，不要落進下面的通用 except ——
                 #    「已經在執行了」不是「設定頁面壞了」，而且它會讓
                 #    **兩個行程共用 config.toml 互相覆蓋**（實測症狀：
                 #    設定存了又變回去、模型自己換掉）。訊息要具體可行。
-                print("\n  ⚠️ 已經有另一個 VibeTalkie 在用這個 port。")
-                print(f"     {exc}")
-                print("\n  同時跑兩個會讓設定互相覆蓋。請先關掉舊的那一個"
-                      "（⌘Q 完全結束，不是關視窗），")
-                print(f"  或改用別的 port：--port {ui_port + 100}")
+                # ⚠️ 與 Windows 進入點**刻意不同**：mac 的錄音功能不靠 UI，
+                #    所以在這裡只是警告（`action=` 那句話因此要換掉），
+                #    而不是像 Windows 那樣拒絕啟動整個程式。
+                for line in launch_guard.explain(
+                        exc,
+                        command="python3 app/mac_vibetalkie.py",
+                        close_hints=["⌘Q 完全結束舊的 VibeTalkie（只關視窗不算）"],
+                        alt_port=ui_port + 100,
+                        action="所以設定頁面不會啟動（錄音功能不受影響）。"):
+                    print(line)
             except Exception as exc:                    # noqa: BLE001
                 print(f"\n  ⚠️ 設定頁面啟動失敗（不影響錄音功能）：{exc}")
         else:
