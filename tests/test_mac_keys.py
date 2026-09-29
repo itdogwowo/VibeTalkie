@@ -61,10 +61,20 @@ def test_key_tables() -> None:
     # ⚠️ 這一條抓的是「表裡有但反查不到」——那種 bug 的症狀是
     #    「UI 列得出來、使用者選了、按了沒反應」。
     if IS_MAC:
-        pairs = list(keys_mod._MACOS_KEYCODE_TO_NAME.items())   # noqa: SLF001
+        # macOS 表是 `{keycode: name}`
+        pairs = [(code, name)
+                 for code, name in keys_mod._MACOS_KEYCODE_TO_NAME.items()]  # noqa: SLF001
     else:
+        # ⚠️ Windows 表是 `{name: vk}` —— **順序與 macOS 相反**。
+        #    這裡原本寫 `(n2v, _) = keys_mod._windows_tables()` 之後直接
+        #    `pairs = list(n2v.items())`，於是迴圈的 `(code, name)` 拿到
+        #    `(name, vk)`：`name` 是整數 → `name_to_code(int)` 直接
+        #    `AttributeError: 'int' object has no attribute 'strip'`。
+        #    在 macOS 上跑不到這一支（那時走上面的分支），所以只有
+        #    「在 Windows 上跑 mac 測試」才會踩到（實測踩到）。
+        #    統一成 `(code, name)` 之後，下面的比對邏輯才對兩個平台都成立。
         n2v, _ = keys_mod._windows_tables()                     # noqa: SLF001
-        pairs = list(n2v.items())
+        pairs = [(vk, name) for name, vk in n2v.items()]
 
     bad: list[str] = []
     for code, name in pairs:
